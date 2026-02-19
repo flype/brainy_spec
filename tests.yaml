@@ -1,0 +1,1057 @@
+version: "0.1.0"
+
+# Reference values:
+# - Embedding dimensions: 3072 (Gemini), 1536 (OpenAI)
+# - Chunking threshold: 24000 chars
+# - Max chunk size: 4000 chars
+# - Chunk overlap: 400 chars
+# - Min chunk size: 100 chars
+# - RRF constant k: 50 (default)
+# - Default semantic weight: 0.6, lexical weight: 0.4
+# - Job queue: 5 workers, 100 buffer, 3 max retries
+
+# =============================================================================
+# SYSTEM INVARIANTS -- Properties that must hold after any state mutation
+# =============================================================================
+invariants:
+  - name: "invariant - every bookmark has non-empty content"
+    after: [UpsertBookmark, CreateBookmarkWithEmbedding, ReextractBookmark]
+    property: "SELECT COUNT(*) FROM bookmarks WHERE content IS NULL OR content = '' == 0"
+
+  - name: "invariant - non-null URLs are unique"
+    after: [UpsertBookmark, CreateBookmarkWithEmbedding]
+    property: "SELECT url, COUNT(*) FROM bookmarks WHERE url IS NOT NULL GROUP BY url HAVING COUNT(*) > 1 returns 0 rows"
+
+  - name: "invariant - read_status is never null"
+    after: ["*"]
+    property: "SELECT COUNT(*) FROM bookmarks WHERE read_status IS NULL == 0"
+
+  - name: "invariant - tsv always in sync with content"
+    after: [UpsertBookmark, CreateBookmarkWithEmbedding, UpdateBookmarkNote]
+    property: "tsv column == to_tsvector('english', coalesce(title, '') || ' ' || content) for all bookmarks"
+
+  - name: "invariant - chunk count matches actual chunks"
+    after: [CreateChunks, DeleteChunks, DeleteBookmark]
+    property: "For all bookmarks: is_chunked == (chunk_count > 0) AND chunk_count == COUNT(bookmark_chunks WHERE bookmark_id = id)"
+
+  - name: "invariant - cascade deletion removes chunks"
+    after: [DeleteBookmark]
+    property: "No bookmark_chunks rows exist for the deleted bookmark_id"
+
+  - name: "invariant - cascade deletion removes jobs"
+    after: [DeleteBookmark]
+    property: "No bookmark_jobs rows exist with bookmark_id = deleted id"
+
+  - name: "invariant - job status follows state machine"
+    after: [ProcessJob, CreateJob]
+    property: "job.status IN ('pending', 'processing', 'completed', 'failed') AND status transitions are forward-only"
+
+  - name: "invariant - updated_at auto-updates on modification"
+    after: [UpsertBookmark, UpdateBookmarkNote, ToggleReadStatus]
+    property: "bookmark.updated_at >= pre_update_timestamp"
+
+  - name: "invariant - embedding dimensions match provider config"
+    after: [CreateBookmarkWithEmbedding, GenerateEmbedding]
+    property: "len(embedding) == provider.GetDimensions() for all non-null embeddings"
+
+  - name: "invariant - graph entity nodes have dual labels"
+    after: [ExtractAndStoreEntities]
+    property: "All Person/Organization/Technology/Project nodes also have :Entity label"
+
+  - name: "invariant - graph nodes use MERGE (no duplicates)"
+    after: [ExtractAndStoreEntities]
+    property: "No two nodes of the same type share the same name"
+
+  - name: "invariant - orphaned graph nodes are cleaned up"
+    after: [DeleteBookmarkFromGraph]
+    property: "No Category/Concept/Entity nodes exist with zero relationships"
+
+# =============================================================================
+# BEHAVIORAL PROPERTIES -- Universal truths for generative testing
+# =============================================================================
+properties:
+  - name: "property - chunk coverage: chunks cover entire content"
+    functions: [ChunkContent]
+    for_all: { content: "any string with len > 0", config: "valid ChunkConfig" }
+    property: "concatenation of non-overlapping portions of all chunks == original content"
+
+  - name: "property - chunk determinism: same input produces same output"
+    functions: [ChunkContent]
+    for_all: { content: "any string", config: "valid ChunkConfig" }
+    property: "ChunkContent(content, config) == ChunkContent(content, config)"
+
+  - name: "property - single chunk for short content"
+    functions: [ChunkContent]
+    for_all: { content: "string with len <= MaxChunkSize" }
+    property: "len(ChunkContent(content)) == 1 && chunks[0].Content == content"
+
+  - name: "property - URL type detection is mutually exclusive"
+    functions: [IsYouTubeURL, IsTwitterURL, IsInstagramURL, IsTikTokURL, detectContentType]
+    for_all: { url: "any valid URL string" }
+    property: "exactly one of the Is*URL functions returns true, OR all return false (webpage default)"
+
+  - name: "property - query classification is deterministic"
+    functions: [ClassifyQuery]
+    for_all: { query: "any non-empty string", hasContext: "boolean" }
+    property: "ClassifyQuery(query, hasContext) == ClassifyQuery(query, hasContext)"
+
+  - name: "property - RRF score bounded for non-null ranks"
+    functions: [rrf_score]
+    for_all: { rank: "integer >= 1", k: "integer > 0" }
+    property: "0 < rrf_score(rank, k) <= 1/k"
+
+  - name: "property - RRF score zero for null rank"
+    functions: [rrf_score]
+    for_all: { k: "integer > 0" }
+    property: "rrf_score(NULL, k) == 0"
+
+  - name: "property - RRF score monotonically decreasing"
+    functions: [rrf_score]
+    for_all: { rank_a: "integer >= 1", rank_b: "integer > rank_a", k: "integer > 0" }
+    property: "rrf_score(rank_a, k) > rrf_score(rank_b, k)"
+
+  - name: "property - search results ordered by score descending"
+    functions: [HybridSearch, UnifiedHybridSearch, HybridSearchMultilingual]
+    for_all: { embedding: "valid vector", query: "non-empty string", limit: "integer > 0" }
+    property: "results[i].score >= results[i+1].score for all i"
+
+  - name: "property - upsert preserves ID for existing URLs"
+    functions: [UpsertBookmark]
+    for_all: { bookmark: "bookmark with existing URL" }
+    property: "upsert(bookmark).id == existing_bookmark_with_same_url.id"
+
+  - name: "property - delete removes all traces"
+    functions: [DeleteBookmark, DeleteBookmarkFromGraph]
+    for_all: { id: "valid bookmark UUID" }
+    property: "after delete: !exists(bookmarks[id]) && count(bookmark_chunks[bookmark_id=id]) == 0"
+
+  - name: "property - cleanText is idempotent"
+    functions: [cleanText]
+    for_all: { text: "any string" }
+    property: "cleanText(cleanText(text)) == cleanText(text)"
+
+  - name: "property - search filters out low scores"
+    functions: [hybrid_search_bookmarks]
+    for_all: { embedding: "valid vector", query: "non-empty string" }
+    property: "for all results r: r.combined_score > 0.01"
+
+# =============================================================================
+# INTERFACE CONTRACTS -- HTTP endpoint schema conformance
+# =============================================================================
+contracts:
+  - name: "contract - POST /add request shape"
+    endpoint: "POST /add"
+    direction: request
+    schema:
+      required_fields: {}
+      optional_fields:
+        url: { type: "string", constraints: "valid URL" }
+        notes: { type: "string" }
+        created_at: { type: "string", constraints: "ISO 8601 or 2006-01-02T15:04:05" }
+      validation: "at least one of url or notes must be non-empty"
+
+  - name: "contract - POST /add success response (202)"
+    endpoint: "POST /add"
+    direction: response
+    status: 202
+    schema:
+      required_fields:
+        success: { type: "boolean", constraints: "== true" }
+        message: { type: "string" }
+        job_id: { type: "string", constraints: "valid UUID" }
+
+  - name: "contract - POST /add duplicate response (409)"
+    endpoint: "POST /add"
+    direction: response
+    status: 409
+    schema:
+      required_fields:
+        success: { type: "boolean", constraints: "== false" }
+        message: { type: "string" }
+        id: { type: "string", constraints: "valid UUID" }
+
+  - name: "contract - GET /answer SSE citation event shape"
+    endpoint: "GET /answer"
+    direction: response
+    event_type: "citation"
+    schema:
+      required_fields:
+        number: { type: "integer", constraints: "> 0" }
+        id: { type: "string", constraints: "valid UUID" }
+        title: { type: "string" }
+        url: { type: "string" }
+        domain: { type: "string" }
+        content_type: { type: "string" }
+        created_at: { type: "string" }
+
+  - name: "contract - GET /answer SSE stream terminates with done"
+    endpoint: "GET /answer"
+    direction: response
+    property: "stream always ends with event: done"
+
+  - name: "contract - GET /bookmarks response shape"
+    endpoint: "GET /bookmarks"
+    direction: response
+    status: 200
+    schema:
+      required_fields:
+        bookmarks: { type: "array" }
+        total: { type: "integer" }
+        limit: { type: "integer" }
+        offset: { type: "integer" }
+
+  - name: "contract - GET /bookmarks pagination invariant"
+    endpoint: "GET /bookmarks"
+    direction: response
+    property: "bookmarks.length <= limit"
+
+  - name: "contract - DELETE /bookmark/{id} success returns 204"
+    endpoint: "DELETE /bookmark/{id}"
+    direction: response
+    status: 204
+    schema:
+      required_fields: {}
+
+  - name: "contract - DELETE /bookmark/{id} not found returns 404"
+    endpoint: "DELETE /bookmark/{id}"
+    direction: response
+    status: 404
+    schema:
+      required_fields:
+        success: { type: "boolean", constraints: "== false" }
+        message: { type: "string" }
+
+  - name: "contract - GET /job/{id} response shape"
+    endpoint: "GET /job/{id}"
+    direction: response
+    status: 200
+    schema:
+      required_fields:
+        id: { type: "string" }
+        url: { type: "string" }
+        status: { type: "string", constraints: "IN ('pending', 'processing', 'completed', 'failed')" }
+        retryCount: { type: "integer" }
+        createdAt: { type: "string" }
+
+  - name: "contract - GET /job/{id} completed has bookmarkId"
+    endpoint: "GET /job/{id}"
+    direction: response
+    property: "status == 'completed' implies bookmarkId is present and non-empty"
+
+  - name: "contract - GET /health always returns 200"
+    endpoint: "GET /health"
+    direction: response
+    status: 200
+    schema:
+      required_fields:
+        status: { type: "string", constraints: "== 'healthy'" }
+
+  - name: "contract - POST /bookmarks/check response shape"
+    endpoint: "POST /bookmarks/check"
+    direction: response
+    status: 200
+    schema:
+      required_fields:
+        exists: { type: "boolean" }
+      optional_fields:
+        bookmark_id: { type: "string", constraints: "present when exists == true" }
+
+  - name: "contract - PATCH /bookmark/{id}/read-status response shape"
+    endpoint: "PATCH /bookmark/{id}/read-status"
+    direction: response
+    status: 200
+    schema:
+      required_fields:
+        id: { type: "string" }
+        url: { type: "string" }
+        read_status: { type: "boolean" }
+        updated_at: { type: "string" }
+
+  - name: "contract - GET /bookmark/detail response shape"
+    endpoint: "GET /bookmark/detail"
+    direction: response
+    status: 200
+    schema:
+      required_fields:
+        id: { type: "string" }
+        content: { type: "string" }
+        read_status: { type: "boolean" }
+        created_at: { type: "string" }
+
+# =============================================================================
+# FUNCTION EVALUATIONS -- Per-function behavioral checks
+# =============================================================================
+
+# -- Content Type Detection ---------------------------------------------------
+detectContentType:
+  # DURABLE -- Boundary tests for URL pattern matching
+  - name: "boundary - YouTube standard watch URL"
+    durability: durable
+    input: { url: "https://www.youtube.com/watch?v=dQw4w9WgXcQ" }
+    output: "youtube"
+
+  - name: "boundary - YouTube short URL"
+    durability: durable
+    input: { url: "https://youtu.be/dQw4w9WgXcQ" }
+    output: "youtube"
+
+  - name: "boundary - YouTube shorts URL"
+    durability: durable
+    input: { url: "https://youtube.com/shorts/abc12345678" }
+    output: "youtube"
+
+  - name: "boundary - YouTube mobile URL"
+    durability: durable
+    input: { url: "https://m.youtube.com/watch?v=dQw4w9WgXcQ" }
+    output: "youtube"
+
+  - name: "boundary - Twitter status URL"
+    durability: durable
+    input: { url: "https://twitter.com/user/status/1234567890" }
+    output: "twitter"
+
+  - name: "boundary - X.com status URL"
+    durability: durable
+    input: { url: "https://x.com/user/status/1234567890" }
+    output: "twitter"
+
+  - name: "boundary - ThreadReaderApp URL"
+    durability: durable
+    input: { url: "https://threadreaderapp.com/thread/1234567890" }
+    output: "twitter"
+
+  - name: "boundary - Instagram post URL"
+    durability: durable
+    input: { url: "https://www.instagram.com/p/ABC123/" }
+    output: "instagram"
+
+  - name: "boundary - Instagram reel URL"
+    durability: durable
+    input: { url: "https://www.instagram.com/reel/ABC123/" }
+    output: "instagram"
+
+  - name: "boundary - TikTok video URL"
+    durability: durable
+    input: { url: "https://www.tiktok.com/@user/video/1234567890123456789" }
+    output: "tiktok"
+
+  - name: "boundary - TikTok short URL"
+    durability: durable
+    input: { url: "https://vt.tiktok.com/abc123/" }
+    output: "tiktok"
+
+  - name: "boundary - generic webpage URL"
+    durability: durable
+    input: { url: "https://example.com/article/hello-world" }
+    output: "webpage"
+
+  # DURABLE -- Error cases
+  - name: "error - empty URL defaults to webpage"
+    durability: durable
+    input: { url: "" }
+    output: "webpage"
+
+  # EPHEMERAL -- Edge cases
+  - name: "edge - YouTube URL with extra params"
+    durability: ephemeral
+    input: { url: "https://www.youtube.com/watch?v=dQw4w9WgXcQ&t=120&list=PLrAXtmErZgOeiKm4sgNOknGvNjby9efdf" }
+    output: "youtube"
+
+  - name: "edge - YouTube embed URL"
+    durability: ephemeral
+    input: { url: "https://www.youtube.com/embed/dQw4w9WgXcQ" }
+    output: "youtube"
+
+  - name: "edge - YouTube live URL"
+    durability: ephemeral
+    input: { url: "https://www.youtube.com/live/dQw4w9WgXcQ" }
+    output: "youtube"
+
+  - name: "edge - Instagram TV URL"
+    durability: ephemeral
+    input: { url: "https://www.instagram.com/tv/ABC123/" }
+    output: "instagram"
+
+  - name: "edge - TikTok vm short URL"
+    durability: ephemeral
+    input: { url: "https://vm.tiktok.com/abc123/" }
+    output: "tiktok"
+
+# -- RRF Score ----------------------------------------------------------------
+rrf_score:
+  # DURABLE -- Boundary tests
+  - name: "boundary - rank 1 with default k=50"
+    durability: durable
+    input: { rank: 1, rrf_k: 50 }
+    output: 0.0196078431
+
+  - name: "boundary - rank 10 with default k=50"
+    durability: durable
+    input: { rank: 10, rrf_k: 50 }
+    output: 0.0166666667
+
+  - name: "boundary - null rank returns 0"
+    durability: durable
+    input: { rank: null, rrf_k: 50 }
+    output: 0.0
+
+  - name: "boundary - rank 1 with k=10"
+    durability: durable
+    input: { rank: 1, rrf_k: 10 }
+    output: 0.0909090909
+
+  # EPHEMERAL -- Progression
+  - name: "example - rank 100 with default k"
+    durability: ephemeral
+    input: { rank: 100, rrf_k: 50 }
+    output: 0.0066666667
+
+# -- Query Classification ----------------------------------------------------
+ClassifyQuery:
+  # DURABLE -- Each intent has at least one test
+  - name: "boundary - URL query classifies as url_specific"
+    durability: durable
+    input: { query: "https://example.com/article", hasContext: false }
+    output: { intent: "url_specific" }
+
+  - name: "boundary - help command classifies as command"
+    durability: durable
+    input: { query: "help", hasContext: false }
+    output: { intent: "command" }
+
+  - name: "boundary - temporal query with recent"
+    durability: durable
+    input: { query: "recent bookmarks", hasContext: false }
+    output: { intent: "temporal" }
+
+  - name: "boundary - comparison query"
+    durability: durable
+    input: { query: "compare React vs Vue", hasContext: false }
+    output: { intent: "comparative" }
+
+  - name: "boundary - navigational find query"
+    durability: durable
+    input: { query: "find that golang article", hasContext: false }
+    output: { intent: "navigational" }
+
+  - name: "boundary - default informational"
+    durability: durable
+    input: { query: "what are microservices", hasContext: false }
+    output: { intent: "informational" }
+
+  # EPHEMERAL -- More examples
+  - name: "example - graph query about category"
+    durability: ephemeral
+    input: { query: "bookmarks about machine learning", hasContext: false }
+    output: { intent: "graph" }
+
+  - name: "example - conversational with context"
+    durability: ephemeral
+    input: { query: "tell me more about that", hasContext: true }
+    output: { intent: "conversational" }
+
+  - name: "example - author query"
+    durability: ephemeral
+    input: { query: "articles by Dan Abramov", hasContext: false }
+    output: { intent: "author_specific" }
+
+  - name: "example - temporal yesterday"
+    durability: ephemeral
+    input: { query: "what did I save yesterday", hasContext: false }
+    output: { intent: "temporal" }
+
+# -- Content Chunking --------------------------------------------------------
+ChunkContent:
+  # DURABLE -- Boundary tests at chunking thresholds
+  - name: "boundary - content exactly at MaxChunkSize returns 1 chunk"
+    durability: durable
+    input: { content: "x repeated 4000 times", max_chunk_size: 4000, overlap_size: 400, min_chunk_size: 100 }
+    output: { chunk_count: 1 }
+
+  - name: "boundary - content at MaxChunkSize+1 returns 2 chunks"
+    durability: durable
+    input: { content: "x repeated 4001 times", max_chunk_size: 4000, overlap_size: 400, min_chunk_size: 100 }
+    output: { chunk_count: 2 }
+
+  - name: "boundary - empty content returns 1 empty chunk"
+    durability: durable
+    input: { content: "", max_chunk_size: 4000, overlap_size: 400, min_chunk_size: 100 }
+    output: { chunk_count: 1 }
+
+  # DURABLE -- Error cases
+  - name: "error - overlap >= max chunk size"
+    durability: durable
+    input: { content: "hello world", max_chunk_size: 100, overlap_size: 100, min_chunk_size: 50 }
+    error: true
+
+  # EPHEMERAL -- Progression
+  - name: "example - 8000 char content with default config"
+    durability: ephemeral
+    input: { content: "8000 chars of prose with sentences", max_chunk_size: 4000, overlap_size: 400, min_chunk_size: 100 }
+    output: { chunk_count: 3 }
+    note: "3 chunks due to overlap: chunk1=4000, chunk2=4000(with 400 overlap from chunk1), chunk3=remainder"
+
+  - name: "example - chunks respect sentence boundaries"
+    durability: ephemeral
+    input: { content: "First sentence. Second sentence. Third very long sentence that goes on and on...", max_chunk_size: 30, overlap_size: 5, min_chunk_size: 10 }
+    output: { breaks_at_sentence_boundary: true }
+
+ShouldUseChunking:
+  # DURABLE -- Boundary tests at 24000 threshold
+  - name: "boundary - 24000 chars returns false"
+    durability: durable
+    input: { content_length: 24000 }
+    output: false
+
+  - name: "boundary - 24001 chars returns true"
+    durability: durable
+    input: { content_length: 24001 }
+    output: true
+
+  - name: "boundary - 0 chars returns false"
+    durability: durable
+    input: { content_length: 0 }
+    output: false
+
+# -- Add Bookmark API ---------------------------------------------------------
+AddBookmark:
+  # DURABLE -- Contract conformance
+  - name: "boundary - valid URL returns 202 with job_id"
+    durability: durable
+    input: { url: "https://example.com/article" }
+    output: { status: 202, body: { success: true, job_id: "valid_uuid" } }
+
+  - name: "boundary - notes-only returns 202"
+    durability: durable
+    input: { notes: "This is a quick note" }
+    output: { status: 202, body: { success: true } }
+
+  - name: "boundary - duplicate URL returns 409"
+    durability: durable
+    input: { url: "https://already-bookmarked.com" }
+    precondition: "bookmark with this URL exists"
+    output: { status: 409, body: { success: false, id: "existing_uuid" } }
+
+  # DURABLE -- Error cases
+  - name: "error - empty body returns 400"
+    durability: durable
+    input: {}
+    output: { status: 400 }
+
+  - name: "error - both url and notes empty returns 400"
+    durability: durable
+    input: { url: "", notes: "" }
+    output: { status: 400 }
+
+  # EPHEMERAL -- Optional fields
+  - name: "example - URL with notes"
+    durability: ephemeral
+    input: { url: "https://example.com", notes: "Great article about Go" }
+    output: { status: 202 }
+
+  - name: "example - URL with created_at"
+    durability: ephemeral
+    input: { url: "https://example.com/old", created_at: "2023-06-15T10:30:00Z" }
+    output: { status: 202 }
+
+# -- Delete Bookmark API ------------------------------------------------------
+DeleteBookmark:
+  # DURABLE -- Contract conformance
+  - name: "boundary - existing bookmark returns 204"
+    durability: durable
+    input: { id: "valid-existing-uuid" }
+    output: { status: 204 }
+
+  - name: "boundary - non-existent bookmark returns 404"
+    durability: durable
+    input: { id: "non-existent-uuid" }
+    output: { status: 404 }
+
+  - name: "boundary - missing id returns 400"
+    durability: durable
+    input: { id: "" }
+    output: { status: 400 }
+
+  # DURABLE -- Invariant verification post-delete
+  - name: "boundary - delete cascades to chunks"
+    durability: durable
+    input: { id: "chunked-bookmark-uuid" }
+    precondition: "bookmark has 5 chunks in bookmark_chunks"
+    output: { status: 204 }
+    post_condition: "SELECT COUNT(*) FROM bookmark_chunks WHERE bookmark_id = id == 0"
+
+  - name: "boundary - delete removes graph node"
+    durability: durable
+    input: { id: "graphed-bookmark-uuid" }
+    precondition: "bookmark has graph node in Neo4j"
+    output: { status: 204 }
+    post_condition: "graph node for this bookmark ID does not exist"
+
+# -- List Bookmarks API -------------------------------------------------------
+ListBookmarks:
+  # DURABLE -- Pagination invariants
+  - name: "boundary - default pagination limit 50 offset 0"
+    durability: durable
+    input: { }
+    output: { limit: 50, offset: 0, bookmarks_count_lte: 50 }
+
+  - name: "boundary - custom limit capped at 100"
+    durability: durable
+    input: { limit: 200 }
+    output: { limit: 100 }
+
+  - name: "boundary - offset beyond total returns empty"
+    durability: durable
+    input: { offset: 99999 }
+    output: { bookmarks: [] }
+
+  # EPHEMERAL -- Filter combinations
+  - name: "example - filter by read status"
+    durability: ephemeral
+    input: { read_status: "true" }
+    output: { all_bookmarks_have_read_status: true }
+
+  - name: "example - filter by content type video"
+    durability: ephemeral
+    input: { content_type: "video" }
+    output: { all_bookmarks_content_type: "youtube" }
+
+  - name: "example - search with query"
+    durability: ephemeral
+    input: { search: "golang tutorial" }
+    output: { results_ordered_by_relevance: true }
+
+# -- Bookmark Detail API ------------------------------------------------------
+GetBookmarkDetail:
+  # DURABLE -- Contract conformance
+  - name: "boundary - valid id returns full detail"
+    durability: durable
+    input: { id: "valid-uuid" }
+    output: { status: 200, has_id: true, has_content: true, has_read_status: true, has_created_at: true }
+
+  - name: "boundary - missing id returns 400"
+    durability: durable
+    input: {}
+    output: { status: 400 }
+
+  - name: "boundary - non-existent id returns 404"
+    durability: durable
+    input: { id: "non-existent-uuid" }
+    output: { status: 404 }
+
+# -- Toggle Read Status API ---------------------------------------------------
+ToggleReadStatus:
+  # DURABLE -- Toggle behavior
+  - name: "boundary - toggle unread to read sets read_at"
+    durability: durable
+    input: { id: "unread-bookmark-uuid" }
+    precondition: "bookmark.read_status == false"
+    output: { read_status: true, read_at: "non-null timestamp" }
+
+  - name: "boundary - toggle read to unread clears read_at"
+    durability: durable
+    input: { id: "read-bookmark-uuid" }
+    precondition: "bookmark.read_status == true"
+    output: { read_status: false, read_at: null }
+
+# -- Check URL API ------------------------------------------------------------
+CheckURL:
+  # DURABLE -- Existence check
+  - name: "boundary - existing URL returns exists true with id"
+    durability: durable
+    input: { url: "https://existing.example.com" }
+    precondition: "bookmark with this URL exists"
+    output: { exists: true, bookmark_id: "valid-uuid" }
+
+  - name: "boundary - new URL returns exists false"
+    durability: durable
+    input: { url: "https://new.example.com" }
+    output: { exists: false }
+
+  - name: "error - empty URL returns 400"
+    durability: durable
+    input: { url: "" }
+    output: { status: 400 }
+
+# -- Health Check API ---------------------------------------------------------
+Health:
+  # DURABLE -- Always healthy if server is running
+  - name: "boundary - returns healthy status"
+    durability: durable
+    input: {}
+    output: { status: 200, body: { status: "healthy" } }
+
+# -- Job Status API -----------------------------------------------------------
+GetJobStatus:
+  # DURABLE -- Status shape validation
+  - name: "boundary - pending job"
+    durability: durable
+    input: { id: "pending-job-uuid" }
+    precondition: "job exists with status pending"
+    output: { status: "pending", bookmarkId: null }
+
+  - name: "boundary - completed job has bookmarkId"
+    durability: durable
+    input: { id: "completed-job-uuid" }
+    precondition: "job exists with status completed"
+    output: { status: "completed", bookmarkId: "valid-uuid" }
+
+  - name: "boundary - failed job has error message"
+    durability: durable
+    input: { id: "failed-job-uuid" }
+    precondition: "job exists with status failed"
+    output: { status: "failed", error: "non-empty string" }
+
+  - name: "boundary - non-existent job returns 404"
+    durability: durable
+    input: { id: "non-existent-uuid" }
+    output: { status_code: 404 }
+
+# -- Autocomplete API ---------------------------------------------------------
+GetAutocomplete:
+  # DURABLE -- Contract conformance
+  - name: "boundary - empty query returns empty array"
+    durability: durable
+    input: { q: "" }
+    output: []
+
+  - name: "boundary - limit capped at 20"
+    durability: durable
+    input: { q: "test", limit: 50 }
+    output: { result_count_lte: 20 }
+
+  - name: "boundary - graph unavailable returns empty array"
+    durability: durable
+    input: { q: "test" }
+    precondition: "graph service is nil"
+    output: []
+
+# -- Paywall Detection --------------------------------------------------------
+PaywallDetect:
+  # DURABLE -- Known domains
+  - name: "boundary - NYT is known paywall"
+    durability: durable
+    input: { url: "https://www.nytimes.com/article", html: "" }
+    output: { detected: true, confidence_gte: 0.9 }
+
+  - name: "boundary - WSJ is known paywall"
+    durability: durable
+    input: { url: "https://www.wsj.com/article", html: "" }
+    output: { detected: true, confidence_gte: 0.9 }
+
+  - name: "boundary - unknown domain not flagged by domain check"
+    durability: durable
+    input: { url: "https://example-blog.com/post", html: "<html><body><article>Full content here that is quite long and detailed</article></body></html>" }
+    output: { detected: false }
+
+  # DURABLE -- JSON-LD detection
+  - name: "boundary - JSON-LD isAccessibleForFree false"
+    durability: durable
+    input: { url: "https://unknown.com", html: "<script type=\"application/ld+json\">{\"@type\":\"Article\",\"isAccessibleForFree\":false}</script>" }
+    output: { detected: true, confidence: 1.0 }
+
+  # EPHEMERAL -- HTML patterns
+  - name: "example - paywall CSS class detected"
+    durability: ephemeral
+    input: { url: "https://unknown.com", html: "<div class=\"paywall-content\">Subscribe to read</div>" }
+    output: { detected: true }
+
+  - name: "example - Spanish paywall domain"
+    durability: ephemeral
+    input: { url: "https://elpais.com/article", html: "" }
+    output: { detected: true }
+
+# -- Upsert Bookmark ---------------------------------------------------------
+UpsertBookmark:
+  # DURABLE -- Upsert semantics
+  - name: "boundary - new URL creates bookmark"
+    durability: durable
+    input: { url: "https://new.example.com", title: "New Article", content: "Article content" }
+    output: { new_id: "valid-uuid" }
+
+  - name: "boundary - existing URL updates in place"
+    durability: durable
+    input: { url: "https://existing.example.com", title: "Updated Title", content: "Updated content" }
+    precondition: "bookmark with this URL exists with id=ABC"
+    output: { id: "ABC", title: "Updated Title" }
+
+  - name: "boundary - null URL always creates new row"
+    durability: durable
+    input: { url: null, content: "Note content 1" }
+    output: { creates_new_row: true }
+
+  - name: "boundary - second null URL creates another new row"
+    durability: durable
+    input: { url: null, content: "Note content 2" }
+    precondition: "a bookmark with null URL already exists"
+    output: { creates_new_row: true, different_id_from_existing: true }
+
+# -- Hybrid Search ------------------------------------------------------------
+HybridSearch:
+  # DURABLE -- Score filtering
+  - name: "boundary - results with score <= 0.01 are excluded"
+    durability: durable
+    input: { query_embedding: "valid_vector", query_text: "nonsense_query_unlikely_to_match", limit: 10 }
+    output: { all_scores_gt: 0.01 }
+
+  - name: "boundary - results ordered by combined score descending"
+    durability: durable
+    input: { query_embedding: "valid_vector", query_text: "common term", limit: 10 }
+    output: { scores_descending: true }
+
+  - name: "boundary - limit constrains result count"
+    durability: durable
+    input: { query_embedding: "valid_vector", query_text: "test", limit: 3 }
+    output: { result_count_lte: 3 }
+
+# -- Unified Hybrid Search ---------------------------------------------------
+UnifiedHybridSearch:
+  # DURABLE -- Deduplication
+  - name: "boundary - no duplicate bookmark IDs in results"
+    durability: durable
+    input: { embedding: "valid_vector", query: "test query", limit: 20 }
+    output: { unique_bookmark_ids: true }
+
+  # DURABLE -- Graceful degradation
+  - name: "boundary - works when chunk search fails"
+    durability: durable
+    input: { embedding: "valid_vector", query: "test query", limit: 10 }
+    precondition: "bookmark_chunks table does not exist"
+    output: { returns_results: true, only_non_chunked: true }
+
+# -- Graph Entity Extraction --------------------------------------------------
+ExtractAndStoreEntities:
+  # DURABLE -- Node creation invariants
+  - name: "boundary - creates bookmark node with correct id"
+    durability: durable
+    input: { bookmark_id: "uuid-123", content: "Article about Kubernetes deployment" }
+    output: { graph_node_exists: true, node_id: "uuid-123" }
+
+  - name: "boundary - entity nodes have dual labels"
+    durability: durable
+    input: { bookmark_id: "uuid-456", content: "Elon Musk announced new Tesla features" }
+    output: { person_nodes_have_entity_label: true }
+
+  - name: "boundary - MERGE prevents duplicate nodes"
+    durability: durable
+    input: { bookmark_id: "uuid-789", content: "Kubernetes cluster management" }
+    precondition: "Category 'Technology' already exists in graph"
+    output: { technology_category_count: 1 }
+
+# -- Graph Duplicate Detection -----------------------------------------------
+FindDuplicates:
+  # DURABLE -- Threshold behavior
+  - name: "boundary - identical names score 1.0"
+    durability: durable
+    input: { node1_name: "JavaScript", node2_name: "JavaScript" }
+    output: { string_similarity: 1.0, action: "auto_merge" }
+
+  - name: "boundary - known abbreviation detected"
+    durability: durable
+    input: { node1_name: "JavaScript", node2_name: "JS" }
+    output: { is_abbreviation: true, action_gte: "review" }
+
+  - name: "boundary - below threshold is ignored"
+    durability: durable
+    input: { node1_name: "Python", node2_name: "PostgreSQL" }
+    output: { below_threshold: true, action: "ignore" }
+
+  # EPHEMERAL -- Score calculation
+  - name: "example - combined score with vector"
+    durability: ephemeral
+    input: { string_similarity: 0.8, vector_similarity: 0.95 }
+    output: { combined_score: 0.89 }
+    note: "0.8 * 0.4 + 0.95 * 0.6 = 0.89"
+
+  - name: "example - combined score without vector"
+    durability: ephemeral
+    input: { string_similarity: 0.88, vector_similarity: null }
+    output: { combined_score: 0.88 }
+
+# -- Graph Merge Nodes -------------------------------------------------------
+MergeNodes:
+  # DURABLE -- Validation
+  - name: "error - less than 2 node IDs"
+    durability: durable
+    input: { node_ids: ["id1"], target_node_id: "id1" }
+    error: true
+
+  - name: "error - target not in node list"
+    durability: durable
+    input: { node_ids: ["id1", "id2"], target_node_id: "id3" }
+    error: true
+
+  - name: "boundary - successful merge removes source nodes"
+    durability: durable
+    input: { node_ids: ["id1", "id2", "id3"], target_node_id: "id1" }
+    output: { success: true }
+    post_condition: "only id1 node exists, id2 and id3 are deleted, all relationships transferred to id1"
+
+# -- Job Queue ----------------------------------------------------------------
+JobQueue:
+  # DURABLE -- Queue behavior
+  - name: "boundary - enqueue returns immediately"
+    durability: durable
+    input: { job: "valid job" }
+    output: { enqueued: true, blocking: false }
+
+  - name: "boundary - full queue rejects job"
+    durability: durable
+    input: { job: "valid job" }
+    precondition: "queue buffer is full (100 items)"
+    output: { error: "queue full" }
+
+  # DURABLE -- Retry behavior
+  - name: "boundary - retryable error gets retried"
+    durability: durable
+    input: { job: "job that fails with HTTP 500" }
+    output: { retry_count: 3, final_status: "failed" }
+
+  - name: "boundary - non-retryable error fails immediately"
+    durability: durable
+    input: { job: "job with invalid URL" }
+    output: { retry_count: 0, final_status: "failed", error_contains: "invalid URL" }
+
+  - name: "boundary - exponential backoff timing"
+    durability: durable
+    input: { max_retries: 3 }
+    output: { delays: ["1s", "2s", "4s"] }
+
+# -- Embedding Provider -------------------------------------------------------
+EmbeddingProvider:
+  # DURABLE -- Dimension validation
+  - name: "boundary - OpenAI returns 1536 dimensions"
+    durability: durable
+    input: { provider: "openai", text: "Hello world" }
+    output: { dimensions: 1536 }
+
+  - name: "boundary - Gemini returns 3072 dimensions"
+    durability: durable
+    input: { provider: "gemini", text: "Hello world" }
+    output: { dimensions: 3072 }
+
+  # DURABLE -- Long content handling
+  - name: "boundary - OpenAI truncates at 24000 chars"
+    durability: durable
+    input: { provider: "openai", text: "x repeated 30000 times" }
+    output: { embedding_generated: true, dimensions: 1536 }
+    note: "Content is summarized before embedding, not truncated at embed time"
+
+  - name: "boundary - Gemini truncates at 80000 chars"
+    durability: durable
+    input: { provider: "gemini", text: "x repeated 100000 times" }
+    output: { embedding_generated: true, dimensions: 3072 }
+
+# -- SSE Answer Stream --------------------------------------------------------
+AnswerQuestion:
+  # DURABLE -- Stream contract
+  - name: "boundary - missing query returns 400"
+    durability: durable
+    input: { q: "" }
+    output: { status: 400 }
+
+  - name: "boundary - stream ends with done event"
+    durability: durable
+    input: { q: "what is golang" }
+    output: { last_event: "done" }
+
+  - name: "boundary - citations match references in text"
+    durability: durable
+    input: { q: "tell me about React" }
+    output: { citation_numbers_subset_of_text_references: true }
+
+  - name: "boundary - command query returns help without search"
+    durability: durable
+    input: { q: "help" }
+    output: { no_search_performed: true, contains_help_text: true }
+
+# -- Thumbnail Extraction -----------------------------------------------------
+ThumbnailExtraction:
+  # DURABLE -- Platform-specific behavior
+  - name: "boundary - YouTube thumbnail from video ID"
+    durability: durable
+    input: { content_type: "youtube", video_id: "dQw4w9WgXcQ" }
+    output: { primary_url: "https://i.ytimg.com/vi/dQw4w9WgXcQ/maxresdefault.jpg" }
+
+  - name: "boundary - YouTube has fallback thumbnails"
+    durability: durable
+    input: { content_type: "youtube", video_id: "dQw4w9WgXcQ" }
+    output: { alternatives_count_gte: 3 }
+
+  # EPHEMERAL -- Other platforms
+  - name: "example - webpage uses OG image"
+    durability: ephemeral
+    input: { content_type: "webpage", url: "https://example.com" }
+    output: { thumbnail_source: "opengraph" }
+
+# -- Re-extract Bookmark API --------------------------------------------------
+ReextractBookmark:
+  # DURABLE -- Contract conformance
+  - name: "boundary - valid bookmark with URL returns 202"
+    durability: durable
+    input: { id: "bookmark-with-url" }
+    output: { status: 202, body: { success: true, job_id: "valid-uuid" } }
+
+  - name: "boundary - notes-only bookmark returns 400"
+    durability: durable
+    input: { id: "notes-only-bookmark" }
+    precondition: "bookmark has no URL"
+    output: { status: 400 }
+
+  - name: "boundary - non-existent bookmark returns 404"
+    durability: durable
+    input: { id: "non-existent-uuid" }
+    output: { status: 404 }
+
+  - name: "boundary - preserves existing notes"
+    durability: durable
+    input: { id: "bookmark-with-notes-and-url" }
+    precondition: "bookmark has notes='Important article'"
+    output: { status: 202 }
+    post_condition: "after job completes, bookmark.notes == 'Important article'"
+
+# -- Update Notes API ---------------------------------------------------------
+UpdateBookmarkNote:
+  # DURABLE -- Contract conformance
+  - name: "boundary - valid update returns 200"
+    durability: durable
+    input: { id: "valid-uuid", notes: "Updated notes" }
+    output: { status: 200, body: { success: true } }
+
+  - name: "boundary - non-existent bookmark returns 404"
+    durability: durable
+    input: { id: "non-existent-uuid", notes: "Some notes" }
+    output: { status: 404 }
+
+  - name: "boundary - note_tsv updates automatically"
+    durability: durable
+    input: { id: "valid-uuid", notes: "New important content" }
+    post_condition: "note_tsv matches to_tsvector('english', 'New important content')"
+
+# -- HTML to Markdown ---------------------------------------------------------
+convertHTMLToMarkdown:
+  # EPHEMERAL -- Conversion examples
+  - name: "example - headers converted"
+    durability: ephemeral
+    input: { html: "<h1>Title</h1><p>Content</p>" }
+    output: { markdown_contains: "# Title" }
+
+  - name: "example - bold converted"
+    durability: ephemeral
+    input: { html: "<strong>bold text</strong>" }
+    output: { markdown_contains: "**bold text**" }
+
+  - name: "example - links preserved"
+    durability: ephemeral
+    input: { html: "<a href=\"https://example.com\">link</a>" }
+    output: { markdown_contains: "[link](https://example.com)" }
+
+  - name: "example - code blocks preserved"
+    durability: ephemeral
+    input: { html: "<pre><code>var x = 1;</code></pre>" }
+    output: { markdown_contains: "```" }
+
+  - name: "example - nested lists"
+    durability: ephemeral
+    input: { html: "<ul><li>Item 1<ul><li>Sub item</li></ul></li></ul>" }
+    output: { markdown_contains: "  - Sub item" }
