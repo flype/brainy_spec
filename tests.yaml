@@ -838,55 +838,6 @@ ExtractAndStoreEntities:
     precondition: "Category 'Technology' already exists in graph"
     output: { technology_category_count: 1 }
 
-# -- Graph Duplicate Detection -----------------------------------------------
-FindDuplicates:
-  # DURABLE -- Threshold behavior
-  - name: "boundary - identical names score 1.0"
-    durability: durable
-    input: { node1_name: "JavaScript", node2_name: "JavaScript" }
-    output: { string_similarity: 1.0, action: "auto_merge" }
-
-  - name: "boundary - known abbreviation detected"
-    durability: durable
-    input: { node1_name: "JavaScript", node2_name: "JS" }
-    output: { is_abbreviation: true, action_gte: "review" }
-
-  - name: "boundary - below threshold is ignored"
-    durability: durable
-    input: { node1_name: "Python", node2_name: "PostgreSQL" }
-    output: { below_threshold: true, action: "ignore" }
-
-  # EPHEMERAL -- Score calculation
-  - name: "example - combined score with vector"
-    durability: ephemeral
-    input: { string_similarity: 0.8, vector_similarity: 0.95 }
-    output: { combined_score: 0.89 }
-    note: "0.8 * 0.4 + 0.95 * 0.6 = 0.89"
-
-  - name: "example - combined score without vector"
-    durability: ephemeral
-    input: { string_similarity: 0.88, vector_similarity: null }
-    output: { combined_score: 0.88 }
-
-# -- Graph Merge Nodes -------------------------------------------------------
-MergeNodes:
-  # DURABLE -- Validation
-  - name: "error - less than 2 node IDs"
-    durability: durable
-    input: { node_ids: ["id1"], target_node_id: "id1" }
-    error: true
-
-  - name: "error - target not in node list"
-    durability: durable
-    input: { node_ids: ["id1", "id2"], target_node_id: "id3" }
-    error: true
-
-  - name: "boundary - successful merge removes source nodes"
-    durability: durable
-    input: { node_ids: ["id1", "id2", "id3"], target_node_id: "id1" }
-    output: { success: true }
-    post_condition: "only id1 node exists, id2 and id3 are deleted, all relationships transferred to id1"
-
 # -- Job Queue ----------------------------------------------------------------
 JobQueue:
   # DURABLE -- Queue behavior
@@ -1055,3 +1006,309 @@ convertHTMLToMarkdown:
     durability: ephemeral
     input: { html: "<ul><li>Item 1<ul><li>Sub item</li></ul></li></ul>" }
     output: { markdown_contains: "  - Sub item" }
+
+# =============================================================================
+# WEB UI INVARIANTS -- Properties that must hold in the UI layer
+# =============================================================================
+ui_invariants:
+  - name: "ui invariant - bookmarks ordered by date descending (no search)"
+    after: [loadBookmarks]
+    property: "when search query is empty, bookmarks are displayed grouped by date with newest date group first"
+
+  - name: "ui invariant - bookmarks ordered by relevance (with search)"
+    after: [loadBookmarks]
+    property: "when search query is non-empty, bookmarks are ordered by relevance score descending"
+
+  - name: "ui invariant - processing placeholder visible during job processing"
+    after: [addBookmark]
+    property: "a processing placeholder card is visible in the bookmark list from the moment POST /add returns 202 until the job reaches completed or failed status"
+
+  - name: "ui invariant - citations match answer references"
+    after: [askQuestion]
+    property: "every citation card number corresponds to a [N] reference in the rendered answer text, and no citation card exists without a corresponding reference"
+
+  - name: "ui invariant - notification auto-dismisses after 5 seconds"
+    after: [showNotification]
+    property: "notification toast is removed from the DOM within 5500ms of appearing"
+
+  - name: "ui invariant - KG highlights skip code elements"
+    after: [forceHighlight]
+    property: "no <span class='kg-highlight'> elements exist inside <code>, <pre>, <script>, <style>, or <sup> elements"
+
+  - name: "ui invariant - autocomplete closes on blur"
+    after: [blur_search_input]
+    property: "autocomplete dropdown is hidden within 200ms of search input blur event"
+
+# =============================================================================
+# WEB UI EVALUATIONS -- Per-view behavioral checks
+# =============================================================================
+
+# -- Bookmarks View -----------------------------------------------------------
+BookmarksView:
+  # DURABLE -- Core navigation
+  - name: "boundary - clicking bookmark title opens detail modal"
+    durability: durable
+    input: { action: "click bookmark title" }
+    output: { detail_modal_visible: true, modal_bookmark_id: "clicked bookmark id" }
+
+  - name: "boundary - infinite scroll loads next page"
+    durability: durable
+    input: { action: "scroll to within 100px of bottom" }
+    precondition: "more bookmarks exist beyond current page"
+    output: { bookmark_count_increased: true, loading_spinner_shown_during_load: true }
+
+  - name: "boundary - read toggle changes read status"
+    durability: durable
+    input: { action: "click read toggle on unread bookmark" }
+    output: { bookmark_read_status: true, bookmark_opacity: 0.75, read_timestamp_shown: true }
+
+  - name: "boundary - search debounces at 300ms"
+    durability: durable
+    input: { action: "type 'test' in search input" }
+    output: { api_call_delayed_300ms: true, results_reflect_search_query: true }
+
+  - name: "boundary - filters reset pagination"
+    durability: durable
+    input: { action: "change category filter" }
+    output: { offset_reset_to_0: true, bookmarks_reloaded: true }
+
+  # EPHEMERAL -- Filter combinations
+  - name: "example - filter by read status unread"
+    durability: ephemeral
+    input: { read_status: "false" }
+    output: { all_displayed_bookmarks_unread: true }
+
+  - name: "example - filter by content type video"
+    durability: ephemeral
+    input: { content_type: "video" }
+    output: { all_displayed_bookmarks_are_video: true }
+
+  - name: "example - autocomplete shows type-colored pills"
+    durability: ephemeral
+    input: { action: "type 'React' in search", autocomplete_results: ["Technology: React"] }
+    output: { pill_color_for_technology: "indigo" }
+
+  - name: "example - selected node appears as removable pill"
+    durability: ephemeral
+    input: { action: "select autocomplete result" }
+    output: { pill_visible_below_search: true, pill_has_remove_button: true }
+
+# -- Ask View -----------------------------------------------------------------
+AskView:
+  # DURABLE -- Streaming behavior
+  - name: "boundary - question input auto-focuses on view switch"
+    durability: durable
+    input: { action: "switch to ask view" }
+    output: { question_input_focused: true }
+
+  - name: "boundary - submit disabled while streaming"
+    durability: durable
+    input: { action: "submit question while answer is streaming" }
+    output: { submit_button_disabled: true }
+
+  - name: "boundary - answer renders as markdown"
+    durability: durable
+    input: { answer_text: "# Hello\n\n**bold** text" }
+    output: { rendered_html_contains: "<h1>Hello</h1>", rendered_html_contains_2: "<strong>bold</strong>" }
+
+  - name: "boundary - citation click scrolls to citation card"
+    durability: durable
+    input: { action: "click [1] superscript in answer" }
+    output: { citation_card_1_scrolled_into_view: true, citation_card_1_has_ring_highlight: true }
+
+  - name: "boundary - ring highlight disappears after 2 seconds"
+    durability: durable
+    input: { action: "click [1] superscript in answer" }
+    output: { ring_highlight_removed_after_2s: true }
+
+  - name: "boundary - question saved to history (max 10)"
+    durability: durable
+    input: { action: "submit 12 different questions" }
+    output: { history_length: 10, oldest_2_questions_dropped: true }
+
+  - name: "boundary - question history persists across sessions"
+    durability: durable
+    input: { action: "submit question, reload page" }
+    output: { history_contains_previous_question: true }
+
+  # DURABLE -- KG highlighting
+  - name: "boundary - KG highlights applied after streaming completes"
+    durability: durable
+    input: { answer_contains_known_term: "React" }
+    precondition: "'React' exists as a Technology entity in knowledge graph"
+    output: { span_with_class_kg_highlight_exists: true, span_color: "orange" }
+
+  - name: "boundary - KG tooltip shows on highlight click"
+    durability: durable
+    input: { action: "click kg-highlight span for 'React'" }
+    output: { tooltip_visible: true, tooltip_shows_term_name: "React", tooltip_shows_related_bookmarks: true }
+
+  - name: "boundary - KG tooltip closes on Escape"
+    durability: durable
+    input: { action: "press Escape while tooltip is open" }
+    output: { tooltip_visible: false }
+
+  # EPHEMERAL -- Edge cases
+  - name: "example - empty question does not submit"
+    durability: ephemeral
+    input: { question: "" }
+    output: { submit_button_disabled: true, no_api_call: true }
+
+  - name: "example - citations lazy-loaded via IntersectionObserver"
+    durability: ephemeral
+    input: { citations_count: 10, viewport_shows: 3 }
+    output: { detail_loaded_for_visible_citations: true, detail_not_loaded_for_offscreen: true }
+
+# -- Add View -----------------------------------------------------------------
+AddView:
+  # DURABLE -- Core save flow
+  - name: "boundary - URL input auto-focuses on view switch"
+    durability: durable
+    input: { action: "switch to add view" }
+    output: { url_input_focused: true }
+
+  - name: "boundary - submit disabled when both fields empty"
+    durability: durable
+    input: { url: "", notes: "" }
+    output: { submit_button_disabled: true }
+
+  - name: "boundary - submit enabled with URL only"
+    durability: durable
+    input: { url: "https://example.com", notes: "" }
+    output: { submit_button_disabled: false }
+
+  - name: "boundary - submit enabled with notes only"
+    durability: durable
+    input: { url: "", notes: "Quick thought" }
+    output: { submit_button_disabled: false }
+
+  - name: "boundary - double-submit prevented"
+    durability: durable
+    input: { action: "click submit twice rapidly" }
+    output: { api_calls_count: 1 }
+
+  - name: "boundary - successful add switches to bookmarks view"
+    durability: durable
+    input: { url: "https://example.com" }
+    output: { view_after_submit: "bookmarks", processing_placeholder_visible: true }
+
+  - name: "boundary - duplicate URL highlights existing bookmark"
+    durability: durable
+    input: { url: "https://already-saved.com" }
+    precondition: "bookmark with this URL exists"
+    output: { view: "bookmarks", existing_bookmark_has_yellow_border: true, highlight_animation_plays: true }
+
+  # EPHEMERAL -- Notes-only
+  - name: "example - notes-only bookmark uses POST /note"
+    durability: ephemeral
+    input: { url: "", notes: "Remember this idea" }
+    output: { api_endpoint: "POST /note" }
+
+# -- Detail Modal -------------------------------------------------------------
+DetailModal:
+  # DURABLE -- Modal behavior
+  - name: "boundary - modal opens with correct bookmark data"
+    durability: durable
+    input: { action: "click bookmark title with id=ABC" }
+    output: { modal_visible: true, modal_content_id: "ABC", api_call: "GET /bookmark/detail?id=ABC" }
+
+  - name: "boundary - modal closes on backdrop click"
+    durability: durable
+    input: { action: "click modal backdrop" }
+    output: { modal_visible: false }
+
+  - name: "boundary - modal closes on Escape key"
+    durability: durable
+    input: { action: "press Escape" }
+    output: { modal_visible: false }
+
+  - name: "boundary - delete requires confirmation"
+    durability: durable
+    input: { action: "click delete button in modal" }
+    output: { confirmation_dialog_visible: true, bookmark_not_deleted_yet: true }
+
+  - name: "boundary - delete confirmation removes bookmark"
+    durability: durable
+    input: { action: "click confirm delete" }
+    output: { api_call: "DELETE /bookmark/{id}", modal_closed: true, bookmark_removed_from_list: true }
+
+  - name: "boundary - content preview truncated at 1500 chars"
+    durability: durable
+    input: { bookmark_content_length: 3000 }
+    output: { displayed_content_length_lte: 1500, show_full_button_visible: true }
+
+  - name: "boundary - show full content toggle"
+    durability: durable
+    input: { action: "click Show Full Content" }
+    output: { full_content_visible: true, button_text: "Show Less" }
+
+  - name: "boundary - save notes calls PUT endpoint"
+    durability: durable
+    input: { action: "edit notes, type 'New note', click Save" }
+    output: { api_call: "PUT /bookmark/{id}/notes", body: { notes: "New note" } }
+
+  - name: "boundary - re-extract creates new job"
+    durability: durable
+    input: { action: "click re-extract button" }
+    output: { api_call: "PUT /bookmark/{id}/reextract", response_status: 202 }
+
+  # EPHEMERAL -- Graph data display
+  - name: "example - graph pills clickable to show related"
+    durability: ephemeral
+    input: { action: "click category pill 'Technology'" }
+    output: { related_bookmarks_section_visible: true, api_call: "GET /bookmarks/related?type=category&name=Technology" }
+
+# -- Chrome Extension ---------------------------------------------------------
+ChromeExtension:
+  # DURABLE -- Fast mode behavior
+  - name: "boundary - fast mode popup closes immediately after save"
+    durability: durable
+    input: { action: "click Save Bookmark in fast mode popup" }
+    output: { message_sent_to_background: true, popup_closed: true }
+
+  - name: "boundary - non-http URL disables save button"
+    durability: durable
+    input: { tab_url: "chrome://extensions" }
+    output: { save_button_disabled: true, error_message_shown: true }
+
+  - name: "boundary - non-https URL disables save button"
+    durability: durable
+    input: { tab_url: "file:///home/user/doc.html" }
+    output: { save_button_disabled: true }
+
+  - name: "boundary - keyboard shortcut triggers save"
+    durability: durable
+    input: { action: "press Cmd+Shift+B on any http page" }
+    output: { save_message_sent: true }
+
+  - name: "boundary - context menu saves link URL"
+    durability: durable
+    input: { action: "right-click link, select Save to Smart Bookmark Vault" }
+    output: { saved_url: "the link href, not the page URL" }
+
+  # DURABLE -- Background worker
+  - name: "boundary - save calls POST /add"
+    durability: durable
+    input: { url: "https://example.com" }
+    output: { api_call: "POST /add", body: { url: "https://example.com" } }
+
+  - name: "boundary - save shows notification"
+    durability: durable
+    input: { url: "https://example.com" }
+    output: { chrome_notification_shown: true }
+
+  - name: "boundary - badge shows briefly on success"
+    durability: durable
+    input: { save_result: "success" }
+    output: { badge_text_set: true, badge_cleared_after_3s: true }
+
+  # EPHEMERAL -- Options page
+  - name: "example - test connection checks /health"
+    durability: ephemeral
+    input: { action: "click Test Connection", api_url: "http://localhost:8082" }
+    output: { api_call: "GET http://localhost:8082/health", status_shown: "Connected" }
+
+  - name: "example - reset restores defaults"
+    durability: ephemeral
+    input: { action: "click Reset to Defaults, confirm" }
+    output: { api_url: "http://localhost:8082", theme: "auto" }

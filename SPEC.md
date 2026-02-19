@@ -1,24 +1,24 @@
-# Brainy - Smart Bookmark Vault Specification v0.1.0
+# Brainy - Smart Bookmark Vault Specification v0.3.0
 
 ## Overview
 
-Brainy is a personal bookmark knowledge base that ingests URLs from multiple sources, extracts and enriches content using AI, stores it in PostgreSQL with vector embeddings for hybrid semantic+lexical search, and maintains a Neo4j knowledge graph for entity-based discovery. Users ask natural language questions and receive AI-generated answers with citations from their bookmark collection.
+Brainy is a personal bookmark knowledge base that ingests URLs from multiple sources, extracts and enriches content using AI, stores it in a relational database with vector embeddings for hybrid semantic+lexical search, and maintains a knowledge graph for entity-based discovery. Users ask natural language questions and receive AI-generated answers with citations from their bookmark collection.
 
-The system processes bookmarks asynchronously through a job queue, supports multiple content platforms (YouTube, Twitter/X, Instagram, TikTok, generic web), detects paywalls with archive fallback, and provides multilingual search (English/Spanish) with configurable embedding providers (OpenAI, Gemini).
+The system processes bookmarks asynchronously through a job queue, supports multiple content platforms (YouTube, Twitter/X, Instagram, TikTok, generic web), detects paywalls with archive fallback, and provides multilingual search (English/Spanish) with configurable embedding providers.
 
 ## Design Principles
 
 1. **Async-first ingestion.** Bookmark saving returns immediately with a job ID. All heavy processing (scraping, embedding, graph extraction, chunking) happens in background workers. The user never waits for content processing.
 
-2. **Graceful degradation.** Every optional subsystem (Neo4j graph, Tavily archive fallback, Gemini cleaner, thumbnail extraction, summary generation) can fail without blocking bookmark creation. The core path (scrape -> embed -> store) always completes if the URL is reachable.
+2. **Graceful degradation.** Every optional subsystem (knowledge graph, archive fallback, AI content cleaner, thumbnail extraction, summary generation) can fail without blocking bookmark creation. The core path (scrape -> embed -> store) always completes if the URL is reachable.
 
 3. **Platform-aware extraction.** Each content platform (YouTube, Twitter, Instagram, TikTok) has a specialized extractor that understands the platform's content structure. All platform extractors fall back to generic webpage scraping on failure.
 
-4. **Hybrid search with tunable weights.** Search combines semantic (vector cosine similarity) and lexical (PostgreSQL full-text) signals via Reciprocal Rank Fusion (RRF). Weights are dynamically adjusted based on query intent classification.
+4. **Hybrid search with tunable weights.** Search combines semantic (vector cosine similarity) and lexical (full-text) signals via Reciprocal Rank Fusion (RRF). Weights are dynamically adjusted based on query intent classification.
 
-5. **Knowledge graph as enrichment layer.** Neo4j stores extracted entities, categories, and concepts as a discovery and filtering mechanism. PostgreSQL remains the source of truth for bookmark data. Graph operations never block core CRUD.
+5. **Knowledge graph as enrichment layer.** The graph database stores extracted entities, categories, and concepts as a discovery and filtering mechanism. The relational database remains the source of truth for bookmark data. Graph operations never block core CRUD.
 
-6. **Fire-and-forget post-processing.** Graph entity extraction and content chunking run in detached goroutines after the bookmark is persisted. Their success or failure does not affect the bookmark's existence.
+6. **Fire-and-forget post-processing.** Graph entity extraction and content chunking run in background tasks after the bookmark is persisted. Their success or failure does not affect the bookmark's existence.
 
 ---
 
@@ -32,7 +32,7 @@ Properties that must hold across ALL implementations, regardless of language, ar
 
 - **INV-003**: `read_status` is always set (never null), defaulting to `false`. *Rationale: UI filtering by read status requires a definite boolean value.*
 
-- **INV-004**: The `tsv` (English) and `tsv_es` (Spanish) full-text search vectors are always in sync with `title` + `content`. The `note_tsv` vector is always in sync with `notes`. *Rationale: these are PostgreSQL GENERATED ALWAYS columns that auto-recompute on any change, ensuring search results are never stale.*
+- **INV-004**: The `tsv` (English) and `tsv_es` (Spanish) full-text search vectors are always in sync with `title` + `content`. The `note_tsv` vector is always in sync with `notes`. *Rationale: these are auto-computed columns that recompute on any change, ensuring search results are never stale.*
 
 - **INV-005**: When `is_chunked = true` on a bookmark, `chunk_count > 0` and exactly `chunk_count` rows exist in `bookmark_chunks` for that bookmark ID. When `is_chunked = false`, `chunk_count = 0` and no chunks exist. *Rationale: chunk metadata must match actual chunk data for unified search to work correctly.*
 
@@ -42,11 +42,11 @@ Properties that must hold across ALL implementations, regardless of language, ar
 
 - **INV-008**: The `updated_at` timestamp on bookmarks auto-updates on every row modification via database trigger. *Rationale: consumers of bookmark data can rely on `updated_at` for change detection and cache invalidation.*
 
-- **INV-009**: Embedding vectors have exactly the dimensions configured for the active provider: 3072 for Gemini, 1536 for OpenAI. All vectors in the database use the same dimensionality. *Rationale: pgvector requires consistent dimensions for index operations and cosine similarity calculations.*
+- **INV-009**: Embedding vectors have exactly the dimensions configured for the active embedding provider. All vectors in the database use the same dimensionality. *Rationale: vector indexes require consistent dimensions for index operations and cosine similarity calculations.*
 
-- **INV-010**: In the Neo4j knowledge graph, all entity nodes have dual labels: their specific type label (e.g., `:Person`) plus the generic `:Entity` label. Category and Concept nodes have only their respective single label. *Rationale: enables both type-specific and generic entity queries.*
+- **INV-010**: In the knowledge graph, all entity nodes have dual labels: their specific type label (e.g., `:Person`) plus the generic `:Entity` label. Category and Concept nodes have only their respective single label. *Rationale: enables both type-specific and generic entity queries.*
 
-- **INV-011**: Neo4j node creation uses MERGE (not CREATE) keyed on `name` for categories/concepts/entities and on `id` for bookmarks. This prevents duplicate graph nodes. *Rationale: idempotent graph operations are essential for retry safety and re-indexing.*
+- **INV-011**: Graph node creation uses MERGE (not CREATE) keyed on `name` for categories/concepts/entities and on `id` for bookmarks. This prevents duplicate graph nodes. *Rationale: idempotent graph operations are essential for retry safety and re-indexing.*
 
 - **INV-012**: When a bookmark is deleted from the graph, any category/concept/entity nodes that become orphaned (no remaining relationships) are also deleted. *Rationale: prevents graph pollution with disconnected nodes that no longer relate to any bookmark.*
 
@@ -454,34 +454,34 @@ At least one of `url` or `notes` must be provided.
 ## Output Structure
 
 **Do generate:**
-- Go backend binary (`backend/cmd/server/main.go`)
-- Database migration SQL files (`backend/internal/db/migrations/`)
-- Static web UI (`backend/web/static/index.html`)
+- Backend server binary (HTTP API + static file server)
+- Database migration files (relational schema + vector indexes)
+- Static web UI (single HTML file, no build step)
 
 **Do not generate:**
 - Raycast extension (separate repository)
 - Chrome extension distribution packages
 - iOS Shortcut files (manual creation)
-- Neo4j schema (managed via application-level MERGE operations)
+- Graph database schema (managed via application-level MERGE operations)
 
 ---
 
 ## Type Conventions
 
-Since this spec targets a Go implementation with PostgreSQL:
+Types are described abstractly. Implementations should map to idiomatic types for their target language and database.
 
-| Spec type | Go type | PostgreSQL type |
-|-----------|---------|-----------------|
-| `string` | `string` | `TEXT` |
-| `integer` | `int` | `INTEGER` |
-| `float` | `float64` | `NUMERIC` / `FLOAT` |
-| `boolean` | `bool` | `BOOLEAN` |
-| `uuid` | `string` (UUID format) | `UUID` |
-| `timestamp` | `time.Time` | `TIMESTAMPTZ` |
-| `vector` | `[]float32` | `vector(N)` via pgvector |
-| `tsvector` | N/A (DB-generated) | `TSVECTOR` (GENERATED) |
-| `json_object` | `map[string]interface{}` | `JSONB` |
-| `enum` | `string` (constrained) | Custom ENUM type |
+| Spec type | Meaning |
+|-----------|---------|
+| `string` | Variable-length text |
+| `integer` | Whole number |
+| `float` | Floating-point number |
+| `boolean` | True/false |
+| `uuid` | Universally unique identifier (RFC 4122) |
+| `timestamp` | Date/time with timezone (ISO 8601) |
+| `vector` | Fixed-length array of floats (embedding) |
+| `tsvector` | Full-text search index (auto-generated from content) |
+| `json_object` | Arbitrary key-value structure |
+| `enum` | Constrained string with defined allowed values |
 
 ---
 
@@ -522,13 +522,13 @@ URL type detection follows a priority-ordered chain. The first match wins:
 
 The system uses two distinct scoring methods depending on the search path:
 
-**Path A: Direct Similarity Blending** (default `hybrid_search_bookmarks`)
+**Path A: Direct Similarity Blending** (default)
 ```
-combined_score = MAX((cosine_similarity * 0.6) + (normalized_ts_rank * 0.4), 0.01)
+combined_score = MAX((cosine_similarity * 0.6) + (normalized_text_rank * 0.4), 0.01)
 ```
-Where `cosine_similarity = 1 - cosine_distance` and `normalized_ts_rank = ts_rank_cd / 10.0`.
+Where `cosine_similarity = 1 - cosine_distance` and `normalized_text_rank = full_text_rank / 10.0`.
 
-**Path B: Reciprocal Rank Fusion** (multilingual `hybrid_search_multilingual`)
+**Path B: Reciprocal Rank Fusion** (multilingual)
 ```
 rrf_score(rank, k) = 1.0 / (k + rank)   -- where k defaults to 50
 final_score = (rrf_score(semantic_rank, k) * semantic_weight) + (rrf_score(keyword_rank, k) * lexical_weight)
@@ -591,10 +591,10 @@ For large documents that have been chunked:
 2. **Platform-specific extraction** -- fetch content via specialized extractor
 3. **Fallback to generic scraping** -- if platform extractor fails
 4. **Paywall detection** -- check for paywalled content (known domains, JSON-LD, HTML patterns)
-5. **Archive fallback** -- if paywalled, try archive.today via Tavily or direct fetch
-6. **Content cleaning** -- AI-powered removal of archive UI artifacts (Gemini preferred, OpenAI fallback)
+5. **Archive fallback** -- if paywalled, try archive.today via web archive service or direct fetch
+6. **Content cleaning** -- AI-powered removal of archive UI artifacts
 7. **Title resolution** -- readability title > OG title > first 100 chars of content
-8. **Embedding generation** -- via configured provider (OpenAI or Gemini)
+8. **Embedding generation** -- via configured embedding provider
 9. **Summary generation** -- content-type-aware AI summary (non-blocking)
 10. **Database insert** -- upsert bookmark with embedding vector
 11. **Graph entity extraction** -- async, 2-minute timeout, fire-and-forget
@@ -653,41 +653,34 @@ Four detection methods, ordered by reliability:
 - Results are deduplicated by name across chunks
 - 3 retry attempts with exponential backoff and jitter
 
-### Duplicate Detection and Merging
-
-| Threshold | Default | Purpose |
-|-----------|---------|---------|
-| String similarity | 0.85 | Minimum Levenshtein/Jaro-Winkler average |
-| Vector similarity | 0.90 | Minimum embedding cosine similarity |
-| Auto-merge | 0.95 | Above this, merge without review |
-
-Combined score: `string_sim * 0.4 + vector_sim * 0.6` (when embeddings available), otherwise string similarity alone.
-
 ---
 
 ## Embedding Providers
 
-### Provider Configuration
+### Provider Abstraction
 
-| Provider | Model | Dimensions | Max Input | Task Types |
-|----------|-------|-----------|-----------|------------|
-| OpenAI | `text-embedding-3-small` | 1536 | 24,000 chars (~6K tokens) | No |
-| Gemini | `text-embedding-004` | 3072 (configurable: 768, 1536) | 80,000 chars (~20K tokens) | Yes (RETRIEVAL_DOCUMENT, RETRIEVAL_QUERY, etc.) |
+The system supports multiple embedding providers via a provider abstraction. Each provider must implement:
+- `GenerateEmbedding(text, taskType?) → vector` — generate an embedding vector for content
+- `GenerateChatCompletion(prompt, options?) → text` — generate text via a chat/completion model
+
+Provider configuration specifies:
+- **Dimensions**: The fixed vector length for the provider (must be consistent across all bookmarks)
+- **Max input length**: Character limit before content must be summarized or truncated
+- **Task types**: Whether the provider supports task-type hints (e.g., document vs. query embeddings)
 
 ### Long Content Handling
 
-- OpenAI: Content >24K chars is summarized first, then embedded. Summarization input >100K chars is truncated to first 50K + last 50K.
-- Gemini: Content >80K chars is summarized first, then embedded. Summarization input >200K chars is truncated to first 100K + last 100K.
-- If summarization fails, intelligent truncation finds the last sentence boundary within the allowed range.
+- Content exceeding the provider's max input is summarized first, then the summary is embedded
+- If summarization input is very large, it is truncated using a head+tail strategy (first half + last half of the allowed range)
+- If summarization fails, intelligent truncation finds the last sentence boundary within the allowed range
 
-### Chat Model Selection (Gemini)
+### Chat Model Routing
 
-Dynamic model routing based on request characteristics:
-- JSON extraction with >10K max tokens or >20K input chars: `gemini-2.5-pro`
-- Regular tasks with >50K chars or >10K tokens: `gemini-2.5-pro`
-- Small tasks (<10K chars, <=4K tokens): `gemini-2.5-flash`
-- On 500 error with Pro: fallback to Flash
-- On JSON mode failure: retry without ResponseMIMEType
+Dynamic model selection based on request characteristics:
+- Large or complex tasks (JSON extraction, long inputs): route to a more capable model
+- Small tasks: route to a faster/cheaper model
+- On server error with the primary model: fallback to the secondary model
+- On structured output failure: retry without structured output constraints
 
 ---
 
@@ -702,6 +695,236 @@ Dynamic model routing based on request characteristics:
 | Job Queue Buffer | 100 | Handles burst bookmark saves |
 | Job Max Retries | 3 | With exponential backoff |
 | Job SSE Poll Interval | 500ms | Balance between responsiveness and load |
+
+---
+
+## Web UI
+
+The web UI is a single-page application served as a static HTML file by the backend. No build step is required.
+
+### Views
+
+The application has four primary views, switched via a sticky header navigation bar:
+
+| View | Purpose | Key Interactions |
+|------|---------|-----------------|
+| **Bookmarks** | Browse, search, and filter bookmarks | Search input, autocomplete, category/read/content-type filters, infinite scroll |
+| **Ask** | Ask natural language questions | Question input, streaming answer display, citation cards, knowledge graph highlights |
+| **Add** | Save new bookmarks or notes | URL input, notes textarea, submit button |
+### Bookmarks View
+
+**Search and filtering:**
+- Free-text search input with 300ms debounce, triggers hybrid search on the backend
+- Autocomplete dropdown fed by `GET /autocomplete`, showing graph node suggestions with type-colored pills (blue=Category, green=Concept, purple=Topic, orange=Person, red=Organization, indigo=Technology, pink=Project)
+- Selected autocomplete nodes appear as removable pills and are sent as `nodes[]` query parameters for graph-enhanced filtering
+- Category dropdown filter populated from `GET /categories?with_counts=true`
+- Read status filter: All / Unread Only / Read Only
+- Content type filter: All / Video Only / Text Only
+- All filters reset pagination and reload from the server
+
+**Bookmark list:**
+- Bookmarks grouped by date with sticky date headers
+- Date labels use smart formatting: "Today", "Yesterday", weekday name for last 7 days, full date otherwise
+- Infinite scroll loads 20 items per page, triggered when user scrolls within 100px of bottom
+- Scroll position is preserved during pagination loads via a locking mechanism
+
+**Bookmark card structure:**
+
+| Element | Behavior |
+|---------|----------|
+| Thumbnail (128x80) | From metadata preview images, falls back to document/note icon |
+| Read/Unread toggle | Circle-check (green) for read, eye (gray) for unread; calls `PATCH /bookmark/{id}/read-status` |
+| Title | Clickable, opens detail modal; falls back to first 50 chars of notes or "Untitled" |
+| URL | Truncated to 100 chars, opens in new tab; hidden for notes |
+| Summary/snippet | 2-line clamp, shows `summary` or `snippet` |
+| Timestamps | "Read: X ago" (green, only for read bookmarks), "X ago" for creation date |
+
+**Processing placeholder:** While a bookmark is being processed, a blue-bordered card with pulse animation shows "Processing bookmark..." with the URL/notes preview and gray skeleton bars.
+
+**Empty state:** When no bookmarks exist, shows a message with an "Add Bookmark" button that switches to the Add view.
+
+### Ask View
+
+**Question submission:**
+- Single text input with blue send button (paper plane icon)
+- Submit disabled when empty or while streaming
+- Questions saved to `localStorage` history (max 10 items)
+- "Quick ask" input also available in the Bookmarks view header, which transfers the question to Ask view
+
+**Answer streaming:**
+- Opens SSE connection to `GET /answer?q=...`
+- Text chunks appended in real-time, rendered as Markdown (GFM enabled)
+- `[N]` citation references are post-processed into clickable superscript links that smooth-scroll to the corresponding citation card with a temporary blue ring highlight (2 seconds)
+- Pulse skeleton shown while waiting for first chunk
+
+**Knowledge graph highlighting:**
+- After streaming completes, the answer text is scanned for known knowledge graph terms (categories, concepts, entities)
+- Matching terms are wrapped in colored spans: blue (category), green (concept), orange (entity)
+- Highlighted terms are clickable, opening a floating tooltip with:
+  - Term name and type
+  - Count of related bookmarks
+  - Up to 3 related bookmark links (expandable to show all)
+  - "Explore" button that submits the term as a new question
+- Tooltip has keyboard support (Enter/Space to activate, Escape to close) and ARIA attributes (`role="dialog"`, `aria-live="polite"`)
+
+**Citation display:**
+- "Sources" section appears below the answer
+- Each citation card shows: citation number (blue circle), thumbnail, title (clickable, opens detail modal), URL (external link), category/concept/entity pills (clickable, trigger related bookmark search), YouTube indicator (channel + duration), creation date
+- Citations are lazy-loaded via IntersectionObserver with 100px rootMargin
+- Only citations actually referenced as `[N]` in the answer text are shown
+
+**Question history:**
+- Previous questions shown below citations
+- Each is clickable to re-submit
+- "Clear All" button removes history from `localStorage`
+
+### Add View
+
+- URL input (optional, type="url") with auto-focus on view switch
+- Notes textarea (optional, free-text)
+- "Add Bookmark" button, disabled when both URL and notes are empty
+- Double-submission prevention via flag with 100ms delay
+- On success: switches to Bookmarks view, shows processing placeholder, monitors job via SSE
+- On duplicate (409): switches to Bookmarks view, scrolls to existing bookmark, applies yellow border + scale highlight animation (1.5s, repeats twice)
+- Notes-only bookmarks use `POST /note` endpoint, URL bookmarks use `POST /add`
+
+### Bookmark Detail Modal
+
+Overlay modal (max-w-4xl, max-h-90vh) opened by clicking any bookmark title. Contains:
+
+1. **Header bar:** Read toggle, re-extract button, delete button
+2. **Title and metadata:** Title, read status badge, URL (external link), creation date
+3. **Preview image** (conditional)
+4. **Knowledge graph metadata:** Clickable pills for categories (blue), concepts (green), topics (purple), entities (orange with type label). Clicking a pill loads related bookmarks inline
+5. **Related bookmarks** (conditional, shown after clicking a graph pill): List of related bookmarks with clickable titles and tag pills
+6. **Summary section**
+7. **Content preview:** Truncated to 1500 chars with "Show Full Content" / "Show Less" toggle
+8. **Personal notes:** View/edit/add mode with textarea and save/cancel buttons. Saving triggers `PUT /bookmark/{id}/notes` and async graph re-indexing
+
+**Delete flow:** Delete button opens a confirmation modal with warning icon, bookmark title, and Cancel/Delete buttons. Delete calls `DELETE /bookmark/{id}` and removes the bookmark from the list.
+
+**Re-extract flow:** Re-extract button calls `PUT /bookmark/{id}/reextract`, which creates a new job. Returns 202 with job ID.
+
+### Notification System
+
+Fixed-position toast in top-right corner with three variants:
+
+| Variant | Color | Use Case |
+|---------|-------|----------|
+| Info | Blue | General information |
+| Success | Green | Successful operations |
+| Error | Red | Failed operations |
+
+Auto-dismisses after 5 seconds. Close button available. Slide-in/fade transitions.
+
+### Responsive Behavior
+
+- PWA meta tags for iOS home screen support
+- Max width container (7xl) centered on large screens
+- Bookmark cards: vertical stack on mobile, horizontal row on desktop
+- Thumbnails: full width on mobile, 128x80 on desktop
+- Filter grid: 1 column on mobile, 2 on tablet, 3 on desktop
+- Responsive text sizes and padding throughout
+
+### URL-Based Navigation
+
+- Supports browser back/forward via `pushState`/`replaceState` with `popstate` listener
+- Query parameters: `bookmark` (opens detail modal), `related_type`, `related_name` (pre-loads related bookmarks)
+- Enables deep-linking to specific bookmark details
+
+### UI Invariants
+
+- **UI-INV-001**: The Bookmarks view always shows bookmarks ordered by creation date descending (newest first) unless a search query is active, in which case results are ordered by relevance score descending. *Rationale: users expect to see their most recent bookmarks first.*
+
+- **UI-INV-002**: A processing placeholder is always visible in the bookmark list while a job is in `pending` or `processing` state. The placeholder is replaced with the real bookmark card upon job completion. *Rationale: provides immediate visual feedback that the save action was received.*
+
+- **UI-INV-003**: Citation numbers in the answer text always correspond to citation cards in the Sources section. Only actually-cited sources are displayed. *Rationale: prevents confusion from showing irrelevant sources.*
+
+- **UI-INV-004**: The notification toast auto-dismisses after 5 seconds. Multiple notifications can be shown simultaneously. *Rationale: transient feedback should not require user action to dismiss.*
+
+- **UI-INV-005**: Knowledge graph highlighted terms in answers are never applied inside code blocks, `<pre>`, `<script>`, `<style>`, or superscript (`<sup>`) elements. *Rationale: prevents corrupting code examples and citation references.*
+
+- **UI-INV-006**: Autocomplete dropdown closes on: blur (200ms delay), Escape key, or selecting a result. It never remains open when the search input loses focus. *Rationale: prevents orphaned dropdowns from blocking interaction.*
+
+---
+
+## Chrome Extension
+
+The Chrome extension provides a minimal browser-integrated bookmark saving experience. It operates in "fast mode" by default -- a single-click save that fires and forgets.
+
+### Popup (Fast Mode -- Default)
+
+The default popup (`popup-fast.html`) shows:
+- Static "Smart Bookmark Vault" header
+- Current page title
+- "Save Bookmark" button
+
+**Save flow:**
+1. User clicks "Save Bookmark"
+2. Button text changes to "Saving...", button disabled
+3. Message `{ action: 'saveBookmark', url }` sent to background service worker
+4. Popup closes immediately (fire-and-forget)
+
+**Validation:** If the current tab URL is not `http://` or `https://`, the save button is disabled with an error message.
+
+### Popup (Analysis Mode -- Available but not default)
+
+A richer popup (`popup.html`) with three analysis tabs:
+- **Similar Bookmarks**: Shows similar existing bookmarks with similarity percentages
+- **Tags**: Shows categories (blue), concepts (green), entities (orange) extracted from the page
+- **AI Analysis**: Shows summary, key differences from existing bookmarks, and save recommendation
+
+The save button adapts based on duplicate detection:
+- `duplicate`: "View Existing Bookmark" (opens the existing bookmark)
+- `update`: "Update Existing"
+- `skip`: "Save Anyway"
+- Default: "Save Bookmark"
+
+Analysis mode calls `POST /bookmarks/check` for duplicate detection and `POST /bookmarks/analyze-url` for full analysis.
+
+### Background Service Worker
+
+Handles three bookmark save entry points:
+1. **Popup message**: Responds to `saveBookmark` action from either popup variant
+2. **Context menu**: "Save to Smart Bookmark Vault" menu item on pages and links
+3. **Keyboard shortcut**: `Cmd+Shift+B` (Mac) / `Ctrl+Shift+B` (Windows/Linux)
+
+All three paths call `POST /add` with `{ url }` and show a Chrome notification on success/failure. On success, the extension badge briefly shows "..." (blue) for 3 seconds.
+
+### Content Script
+
+Injected into every page at `document_idle`:
+- **Metadata extraction**: Extracts title, description, OG image, author, published date, keywords, and JSON-LD structured data. Currently not called by any extension code (reserved for future use).
+- **Visual feedback**: Injects a green toast notification into the page DOM when requested. Currently not called by any extension code.
+- **Keyboard shortcut**: Listens for `Cmd/Ctrl+Shift+B` as a redundant fallback to the Chrome commands API.
+
+### Options Page
+
+Full-page settings interface with three sections:
+
+**Server Configuration:**
+- API URL input (default: `http://localhost:8082`)
+- API Key input (optional, reserved for future auth)
+- "Test Connection" button that calls `GET /health`
+
+**Display Preferences:**
+- Theme selector: Auto (follow system) / Light / Dark
+- Show notifications checkbox
+- Show badge checkbox
+
+**Keyboard Shortcuts:**
+- Displays current shortcut binding (default: `Cmd+Shift+B`)
+- Link to Chrome's extension shortcuts page
+
+Settings stored in browser extension sync storage (syncs across browser instances).
+
+### Extension Invariants
+
+- **EXT-INV-001**: The fast mode popup always closes immediately after sending the save message, regardless of success or failure. *Rationale: fire-and-forget UX -- the user should never wait.*
+
+- **EXT-INV-002**: Non-HTTP/HTTPS URLs (chrome://, file://, etc.) cannot be saved. The save button is disabled with an error message. *Rationale: only web content can be scraped and embedded.*
+
+- **EXT-INV-003**: The keyboard shortcut `Cmd/Ctrl+Shift+B` triggers a save from any page, via either the Chrome commands API or the content script fallback. *Rationale: reliability -- at least one path will work.*
 
 ---
 
@@ -774,19 +997,19 @@ For entries with `error: true`, assert the function raises/returns an error or t
 
 ### Business Invariants (monitored continuously)
 
-- **INV-001**: `SELECT COUNT(*) FROM bookmarks WHERE content IS NULL OR content = ''` should always be 0
-- **INV-002**: `SELECT url, COUNT(*) FROM bookmarks WHERE url IS NOT NULL GROUP BY url HAVING COUNT(*) > 1` should return 0 rows
-- **INV-005**: `SELECT b.id FROM bookmarks b WHERE b.is_chunked = true AND b.chunk_count != (SELECT COUNT(*) FROM bookmark_chunks c WHERE c.bookmark_id = b.id)` should return 0 rows
-- **INV-007**: `SELECT * FROM bookmark_jobs WHERE status NOT IN ('pending', 'processing', 'completed', 'failed')` should return 0 rows
+- **INV-001**: No bookmarks exist with null or empty `content`
+- **INV-002**: No duplicate URLs exist among bookmarks (excluding null URLs)
+- **INV-005**: For every chunked bookmark, `chunk_count` matches the actual number of chunk records
+- **INV-007**: No jobs exist with a status outside the allowed set (`pending`, `processing`, `completed`, `failed`)
 
 ### Cost Metrics
 
 | Metric | Baseline | Alert Threshold |
 |--------|----------|-----------------|
-| Embedding tokens per bookmark | ~2K tokens (OpenAI) / ~5K tokens (Gemini) | > 10K tokens |
+| Embedding tokens per bookmark | ~2-5K tokens (varies by provider) | > 10K tokens |
 | Chat tokens per entity extraction | ~5K tokens | > 20K tokens |
 | Chat tokens per summary | ~1K tokens | > 5K tokens |
-| Tavily API calls per bookmark | 0-1 (only for YouTube/paywalled) | > 3 |
+| Archive API calls per bookmark | 0-1 (only for YouTube/paywalled) | > 3 |
 
 ---
 
@@ -827,6 +1050,57 @@ Before considering the implementation complete:
 
 ---
 
+## Original Implementation Reference
+
+This section documents the technology choices made in the initial implementation. These are not part of the specification — any reimplementation may use different tools, libraries, and services as long as it satisfies the contracts, invariants, and properties defined above.
+
+### Backend
+
+| Component | Technology | Notes |
+|-----------|-----------|-------|
+| Language | Go | Standard library HTTP server |
+| Relational database | PostgreSQL | With pgvector extension for vector indexes |
+| Full-text search | PostgreSQL tsvector | `GENERATED ALWAYS` columns, `ts_rank_cd` for ranking |
+| Knowledge graph | Neo4j | Cypher queries, MERGE for idempotent node creation |
+| Embedding provider (primary) | Google Gemini `text-embedding-004` | 3072 dimensions, task-type support |
+| Embedding provider (secondary) | OpenAI `text-embedding-3-small` | 1536 dimensions |
+| Chat model (large) | Gemini `gemini-2.5-pro` | Used for complex extraction and long content |
+| Chat model (small) | Gemini `gemini-2.5-flash` | Used for summaries and small tasks |
+| Archive/paywall fallback | Tavily API | Retrieves archived versions of paywalled content |
+| Content extraction | go-readability | Based on Mozilla Readability algorithm |
+| Observability | Langfuse | Tracing for AI operations |
+
+### Web UI
+
+| Component | Technology | Notes |
+|-----------|-----------|-------|
+| Framework | Alpine.js | Lightweight reactivity, no build step |
+| Styling | Tailwind CSS | Via CDN, utility-first CSS |
+| Markdown rendering | Marked.js | GFM enabled |
+| Date formatting | Day.js | With relativeTime plugin |
+| Icons | Lucide | SVG icon library |
+| Delivery | All via CDN | No build step required |
+
+### Chrome Extension
+
+| Component | Technology | Notes |
+|-----------|-----------|-------|
+| Storage | `chrome.storage.sync` | Syncs settings across browser instances |
+| Commands | `chrome.commands` API | Keyboard shortcut registration |
+| Notifications | `chrome.notifications` API | Save confirmation feedback |
+
+### Infrastructure
+
+| Component | Technology | Notes |
+|-----------|-----------|-------|
+| Container orchestration | Docker Compose | PostgreSQL + Neo4j services |
+| Development environment | Devbox | Reproducible dev shells |
+| Process management | mise / devbox scripts | Server start/stop/restart |
+
+---
+
 ## Version History
 
+- **v0.3.0** - Abstracted technology references; added Original Implementation Reference section
+- **v0.2.0** - Added Web UI and Chrome Extension specification with UI invariants
 - **v0.1.0** - Initial specification extracted from existing codebase
