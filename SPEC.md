@@ -1,8 +1,10 @@
-# Brainy - Smart Bookmark Vault Specification v0.3.1
+# Brainy - Smart Bookmark Vault Specification v0.4.0
 
 ## Overview
 
-Brainy is a personal bookmark knowledge base that ingests URLs from multiple sources, extracts and enriches content using AI, stores it in a relational database with vector embeddings for hybrid semantic+lexical search, and maintains a knowledge graph for entity-based discovery. Users ask natural language questions and receive AI-generated answers with citations from their bookmark collection.
+Brainy is a single-user, personal bookmark knowledge base that ingests URLs from multiple sources, extracts and enriches content using AI, stores it in a relational database with vector embeddings for hybrid semantic+lexical search, and maintains a knowledge graph for entity-based discovery. Users ask natural language questions and receive AI-generated answers with citations from their bookmark collection.
+
+The system is designed to run on localhost or a private network with no authentication. All API endpoints are unauthenticated.
 
 The system processes bookmarks asynchronously through a job queue, supports multiple content platforms (YouTube, Twitter/X, Instagram, TikTok, generic web), detects paywalls with archive fallback, and provides multilingual search (English/Spanish) with configurable embedding providers.
 
@@ -223,11 +225,11 @@ At least one of `url` or `notes` must be provided.
   "content": string,
   "notes": string (optional),
   "summary": string,
-  "snippet": string,
+  "snippet": string -- First 200 characters of content, used as a preview in list views,
   "read_status": boolean,
   "read_at": string (optional, ISO 8601 timestamp),
   "created_at": string (ISO 8601 timestamp),
-  "metadata": json_object (optional)
+  "metadata": json_object (optional, see Metadata Schema below)
 }
 ```
 
@@ -235,7 +237,8 @@ At least one of `url` or `notes` must be provided.
 - `bookmarks.length <= limit`
 - When `total >= 0`: `offset + bookmarks.length <= total`
 - Results are ordered by `created_at DESC` (for non-search queries) or by relevance score DESC (for search queries)
-- `total` may be `-1` (count error) or `-2` (sentinel for "many results")
+- `total` may be `-1` (count error) or `-2` (sentinel for "many results" when the total count would be expensive to compute, e.g., >10,000 bookmarks)
+- When `nodes[]` is provided, filtering works by querying the knowledge graph for bookmark IDs connected to the named nodes, then filtering the relational query to only those IDs
 
 ---
 
@@ -274,19 +277,19 @@ At least one of `url` or `notes` must be provided.
   "id": string,
   "url": string,
   "status": "pending" | "processing" | "completed" | "failed",
-  "bookmarkId": string (present when status == "completed"),
-  "retryCount": integer,
+  "bookmark_id": string (present when status == "completed"),
+  "retry_count": integer,
   "error": string (present when status == "failed"),
-  "createdAt": string,
-  "startedAt": string (nullable),
-  "completedAt": string (nullable),
+  "created_at": string,
+  "started_at": string (nullable),
+  "completed_at": string (nullable),
   "metadata": object
 }
 ```
 
 **Contract invariants**:
 - `status` only moves forward: pending -> processing -> completed|failed
-- `bookmarkId` is always present when `status == "completed"`
+- `bookmark_id` is always present when `status == "completed"`
 - `error` is always present when `status == "failed"`
 
 ---
@@ -326,7 +329,7 @@ At least one of `url` or `notes` must be provided.
   "content": string,
   "read_status": boolean,
   "created_at": string,
-  "metadata": object,
+  "metadata": json_object (optional, see Metadata Schema below),
   "url": string (optional),
   "title": string (optional),
   "summary": string (optional),
@@ -340,6 +343,22 @@ At least one of `url` or `notes` must be provided.
   } (optional, when graph service enabled)
 }
 ```
+
+---
+
+### Metadata Schema
+
+The `metadata` JSON field stores platform-specific data extracted during ingestion. Its contents vary by content type:
+
+| Content Type | Known Keys | Description |
+|-------------|------------|-------------|
+| `youtube` | `channel`, `duration`, `video_id`, `thumbnail_url`, `publish_date` | YouTube video metadata |
+| `twitter` | `author`, `author_handle`, `tweet_id`, `retweet_count`, `like_count` | Tweet/thread metadata |
+| `instagram` | `author`, `author_handle`, `post_type`, `thumbnail_url` | Instagram post metadata |
+| `tiktok` | `author`, `author_handle`, `video_id`, `thumbnail_url` | TikTok video metadata |
+| `webpage` | `og_image`, `author`, `publish_date`, `description`, `keywords` | Generic webpage metadata extracted from meta tags and JSON-LD |
+
+All keys are optional. Implementations may store additional platform-specific keys beyond those listed here. The `metadata` field may be `null` or an empty object if no metadata was extracted.
 
 ---
 
@@ -411,6 +430,7 @@ At least one of `url` or `notes` must be provided.
 - Only works for bookmarks that have a URL (returns 400 for notes-only)
 - Creates a new job that updates the existing bookmark rather than creating a duplicate
 - Notes are preserved during re-extraction
+- All derived data is regenerated: content, embedding, summary, chunks (if applicable), and graph entities. If summary generation fails, the existing summary is preserved via null-coalescing update.
 
 ---
 
@@ -525,6 +545,7 @@ At least one of `url` or `notes` must be provided.
 - `type` must be one of: `"category"`, `"concept"`, `"entity"`
 - Both `type` and `name` are required
 - If the graph service is unavailable, returns 503 (not an empty result)
+- The `score` field represents graph relationship strength: a measure of how strongly the bookmark is connected to the queried node (e.g., number of shared nodes, relationship depth)
 
 ---
 
@@ -634,19 +655,21 @@ URL type detection follows a priority-ordered chain. The first match wins:
 
 ### Scoring Methods
 
-The system uses two distinct scoring methods depending on the search path:
+The system uses two distinct scoring methods depending on the detected language of the query:
 
-**Path A: Direct Similarity Blending** (default)
+**Path A: Direct Similarity Blending** (default, English queries)
 ```
 combined_score = MAX((cosine_similarity * 0.6) + (normalized_text_rank * 0.4), 0.01)
 ```
 Where `cosine_similarity = 1 - cosine_distance` and `normalized_text_rank = full_text_rank / 10.0`.
 
-**Path B: Reciprocal Rank Fusion** (multilingual)
+**Path B: Reciprocal Rank Fusion** (non-English queries, e.g., Spanish)
 ```
 rrf_score(rank, k) = 1.0 / (k + rank)   -- where k defaults to 50
 final_score = (rrf_score(semantic_rank, k) * semantic_weight) + (rrf_score(keyword_rank, k) * lexical_weight)
 ```
+
+**Path selection**: When the query is detected as non-English (e.g., Spanish), the system uses Path B (RRF) which queries both the English (`tsv`) and Spanish (`tsv_es`) full-text search vectors and merges results via rank fusion. English queries use Path A (Direct Similarity Blending) with only the English `tsv` vector.
 
 ### Query Intent Classification
 
@@ -706,10 +729,10 @@ For large documents that have been chunked:
 3. **Fallback to generic scraping** -- if platform extractor fails
 4. **Paywall detection** -- check for paywalled content (known domains, JSON-LD, HTML patterns)
 5. **Archive fallback** -- if paywalled, try archive.today via web archive service or direct fetch
-6. **Content cleaning** -- AI-powered removal of archive UI artifacts
+6. **Content cleaning** -- AI-powered removal of archive UI artifacts (only applied when content was retrieved via archive fallback; skipped for directly-scraped content)
 7. **Title resolution** -- For URL bookmarks: readability title > OG title > first 100 chars of content. For notes-only bookmarks: always `"Quick Note"`. The UI may override the display title (e.g., showing first 50 chars of notes or "Untitled" when the stored title is empty).
 8. **Embedding generation** -- via configured embedding provider
-9. **Summary generation** -- content-type-aware AI summary (non-blocking)
+9. **Summary generation** -- AI summary using content-type-specific prompts (non-blocking, see [Summary Generation](#summary-generation)). YouTube bookmarks get a video-focused prompt, tweets get a thread-focused prompt, and articles get a general article prompt.
 10. **Database insert** -- upsert bookmark with embedding vector
 11. **Graph entity extraction** -- async, 2-minute timeout, fire-and-forget
 12. **Content chunking** -- async, for content >24,000 chars (matching `ChunkingThreshold`), fire-and-forget
@@ -730,6 +753,52 @@ Four detection methods, ordered by reliability:
 | Known domain list | 0.9 | 80+ hardcoded publication domains |
 | HTML pattern matching | 0.7-0.95 | CSS classes, data attributes, paywall scripts |
 | Content analysis | 0.6 | Truncation indicators in short articles (<500 chars) |
+
+---
+
+## Summary Generation
+
+The system generates AI-powered summaries for bookmarks as part of the ingestion pipeline. Summary generation is **non-blocking** — failure never prevents bookmark creation. The summary is stored in a dedicated field on the bookmark, separate from the `content` field.
+
+There are two distinct summarization paths that serve different purposes:
+
+### Path 1: Content-Type-Aware Summary (User-Facing)
+
+Generated during bookmark ingestion (pipeline step 9) and during re-extraction. The summary is stored in the bookmark's `summary` field and displayed in the UI.
+
+The AI prompt strategy and output budget vary by content type:
+
+| Content Type | Prompt Strategy | Max Output Tokens |
+|---|---|---|
+| `youtube` | Timestamped structured outline with MM:SS format, section headers, speaker attributions, key points per section | 4000-8000 |
+| `twitter` / `tiktok` | Main message, key facts, context, and tone in 2-3 paragraphs | 1000 |
+| `article` / `webpage` | 5-section structure: Main Topic, Key Points, Important Details, Conclusions, Relevance | 2000-8000 |
+| default | Generic: main topic, key points, technical info, conclusions | 2000-8000 |
+
+**Behavioral rules:**
+- Content type is determined by the same URL detection used in the ingestion pipeline (see [Content Type Detection](#content-type-detection))
+- If summary generation fails, the error is logged and the bookmark is created with a null/empty summary
+- On re-extraction, if summary generation fails, the existing summary is preserved (null-coalescing update)
+- Summary output should begin directly with content (no preamble like "Here is a summary...")
+
+### Path 2: Summarize-Then-Embed (Transient)
+
+When content exceeds the embedding provider's maximum input length, it is summarized first, then the *summary* is embedded. This is a transient transformation — the original full content is stored in the `content` field, not the summary.
+
+| Step | Behavior |
+|---|---|
+| Content within provider limit | Embed directly, no summarization |
+| Content exceeds provider limit | Summarize content first, then embed the summary |
+| Content far exceeds limit (e.g., >100K chars) | Truncate to head+tail (first half + last half of allowed range) before summarizing |
+| Summarization fails | Fall back to intelligent truncation at the last sentence boundary within the allowed range |
+
+**Key invariant:** The summarize-then-embed output is **never stored**. It exists only during the embedding generation call. The bookmark's `content` field always contains the original extracted content.
+
+### Storage
+
+- The user-facing summary is stored in a dedicated `summary` column (not inside the `metadata` JSON)
+- The summary has a full-text search index for inclusion in search results
+- When updating a bookmark, a null summary preserves the existing value (null-coalescing)
 
 ---
 
@@ -981,20 +1050,9 @@ The default popup (`popup-fast.html`) shows:
 
 **Validation:** If the current tab URL is not `http://` or `https://`, the save button is disabled with an error message.
 
-### Popup (Analysis Mode -- Available but not default)
+### Popup (Analysis Mode -- Not yet specced)
 
-A richer popup (`popup.html`) with three analysis tabs:
-- **Similar Bookmarks**: Shows similar existing bookmarks with similarity percentages
-- **Tags**: Shows categories (blue), concepts (green), entities (orange) extracted from the page
-- **AI Analysis**: Shows summary, key differences from existing bookmarks, and save recommendation
-
-The save button adapts based on duplicate detection:
-- `duplicate`: "View Existing Bookmark" (opens the existing bookmark)
-- `update`: "Update Existing"
-- `skip`: "Save Anyway"
-- Default: "Save Bookmark"
-
-Analysis mode calls `POST /bookmarks/check` for duplicate detection and `POST /bookmarks/analyze-url` for full analysis.
+Analysis Mode is a planned richer popup with AI-powered bookmark analysis (similar bookmarks, tags, AI summary). It is not part of the current specification. Only Fast Mode is specced.
 
 ### Background Service Worker
 
@@ -1215,6 +1273,8 @@ This section documents the technology choices made in the initial implementation
 
 ## Version History
 
+- **v0.4.0** - Clarified single-user auth model, documented search path switching (language detection), standardized Job Status to snake_case, added metadata schema per content type, documented snippet generation, clarified content cleaning scope (archive-only), documented re-extract full regeneration scope, documented content-type-specific summary prompts, clarified total sentinel -2 threshold, documented nodes[] graph filtering mechanism, documented related bookmarks score field, marked Analysis Mode as not yet specced
+- **v0.3.2** - Added Summary Generation section with content-type-aware strategies and summarize-then-embed path
 - **v0.3.1** - Added missing contracts (related bookmarks, categories), defined RecentBookmark and autocomplete schemas, fixed chunking threshold inconsistency, added notes title resolution
 - **v0.3.0** - Abstracted technology references; added Original Implementation Reference section
 - **v0.2.0** - Added Web UI and Chrome Extension specification with UI invariants

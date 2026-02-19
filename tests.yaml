@@ -1,4 +1,4 @@
-version: "0.3.1"
+version: "0.4.0"
 
 # Reference values:
 # - Embedding dimensions: 3072 (Gemini), 1536 (OpenAI)
@@ -230,13 +230,13 @@ contracts:
         id: { type: "string" }
         url: { type: "string" }
         status: { type: "string", constraints: "IN ('pending', 'processing', 'completed', 'failed')" }
-        retryCount: { type: "integer" }
-        createdAt: { type: "string" }
+        retry_count: { type: "integer" }
+        created_at: { type: "string" }
 
-  - name: "contract - GET /job/{id} completed has bookmarkId"
+  - name: "contract - GET /job/{id} completed has bookmark_id"
     endpoint: "GET /job/{id}"
     direction: response
-    property: "status == 'completed' implies bookmarkId is present and non-empty"
+    property: "status == 'completed' implies bookmark_id is present and non-empty"
 
   - name: "contract - GET /health always returns 200"
     endpoint: "GET /health"
@@ -688,13 +688,13 @@ GetJobStatus:
     durability: durable
     input: { id: "pending-job-uuid" }
     precondition: "job exists with status pending"
-    output: { status: "pending", bookmarkId: null }
+    output: { status: "pending", bookmark_id: null }
 
-  - name: "boundary - completed job has bookmarkId"
+  - name: "boundary - completed job has bookmark_id"
     durability: durable
     input: { id: "completed-job-uuid" }
     precondition: "job exists with status completed"
-    output: { status: "completed", bookmarkId: "valid-uuid" }
+    output: { status: "completed", bookmark_id: "valid-uuid" }
 
   - name: "boundary - failed job has error message"
     durability: durable
