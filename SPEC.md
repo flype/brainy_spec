@@ -1,4 +1,4 @@
-# Brainy - Smart Bookmark Vault Specification v0.3.0
+# Brainy - Smart Bookmark Vault Specification v0.3.1
 
 ## Overview
 
@@ -97,7 +97,7 @@ Contracts specify what crosses boundaries between components. Each contract surv
 
 **Protocol**: HTTP POST
 
-**Endpoint**: `/add`
+**Endpoint**: `/add` (alias: `/note` — identical behavior, provided for semantic clarity in UI code)
 
 **Request schema**:
 ```
@@ -211,6 +211,23 @@ At least one of `url` or `notes` must be provided.
   "offset": integer,
   "category": string,
   "search": string
+}
+```
+
+**RecentBookmark type**:
+```
+{
+  "id": string (uuid),
+  "url": string,
+  "title": string,
+  "content": string,
+  "notes": string (optional),
+  "summary": string,
+  "snippet": string,
+  "read_status": boolean,
+  "read_at": string (optional, ISO 8601 timestamp),
+  "created_at": string (ISO 8601 timestamp),
+  "metadata": json_object (optional)
 }
 ```
 
@@ -443,11 +460,108 @@ At least one of `url` or `notes` must be provided.
 
 **Endpoint**: `/autocomplete?q={query}&limit={n}`
 
-**Response schema (200)**: Array of suggestion objects from graph service.
+**Response schema (200)**:
+```
+[
+  {
+    "name": string -- Node name (e.g., "React", "Technology"),
+    "type": string -- Node type: "Category" | "Concept" | "Topic" | "Person" | "Organization" | "Technology" | "Project",
+    "count": integer -- Number of bookmarks associated with this node,
+    "description": string (optional) -- Node description,
+    "score": float (optional) -- Relevance score (1.0 = exact match, 0.8 = starts-with, 0.6 = contains)
+  }
+]
+```
 
 **Contract invariants**:
 - Returns empty array `[]` on any error or when graph service is unavailable
 - `limit` is capped at 20
+- Results are ordered by relevance score descending, then bookmark count descending
+
+---
+
+### Client -> Backend: Related Bookmarks
+
+**Protocol**: HTTP GET
+
+**Endpoint**: `/bookmarks/related?type={type}&name={name}`
+
+**Request** (query parameters):
+```
+{
+  "type": "category" | "concept" | "entity" (required),
+  "name": string (required) -- Graph node name to search by
+}
+```
+
+**Response schema (200)**:
+```
+{
+  "bookmarks": [
+    {
+      "id": string,
+      "url": string,
+      "title": string,
+      "score": float,
+      "categories": [string],
+      "concepts": [string],
+      "entities": [string],
+      "metadata": json_object (optional),
+      "created_at": string,
+      "graph_data": object (optional, when graph service available)
+    }
+  ],
+  "total": integer,
+  "type": string -- Echo of the requested type,
+  "name": string -- Echo of the requested name
+}
+```
+
+**Error schema (400)**: Missing or invalid `type` or `name` parameter.
+
+**Error schema (503)**: Graph service unavailable.
+
+**Contract invariants**:
+- `type` must be one of: `"category"`, `"concept"`, `"entity"`
+- Both `type` and `name` are required
+- If the graph service is unavailable, returns 503 (not an empty result)
+
+---
+
+### Client -> Backend: Categories
+
+**Protocol**: HTTP GET
+
+**Endpoint**: `/categories`
+
+**Request** (query parameters):
+```
+{
+  "with_counts": "true" (optional) -- Include bookmark and subcategory counts
+}
+```
+
+**Response schema (200)**:
+```
+{
+  "categories": [
+    {
+      "name": string,
+      "description": string (optional),
+      "level": integer,
+      "bookmark_count": integer (only when with_counts=true),
+      "sub_category_count": integer (only when with_counts=true)
+    }
+  ],
+  "count": integer -- Total number of categories
+}
+```
+
+**Error schema (501)**: Graph service not configured.
+
+**Contract invariants**:
+- Requires graph service; returns 501 if not available
+- `bookmark_count` and `sub_category_count` are only present when `with_counts=true`
 
 ---
 
@@ -593,12 +707,12 @@ For large documents that have been chunked:
 4. **Paywall detection** -- check for paywalled content (known domains, JSON-LD, HTML patterns)
 5. **Archive fallback** -- if paywalled, try archive.today via web archive service or direct fetch
 6. **Content cleaning** -- AI-powered removal of archive UI artifacts
-7. **Title resolution** -- readability title > OG title > first 100 chars of content
+7. **Title resolution** -- For URL bookmarks: readability title > OG title > first 100 chars of content. For notes-only bookmarks: always `"Quick Note"`. The UI may override the display title (e.g., showing first 50 chars of notes or "Untitled" when the stored title is empty).
 8. **Embedding generation** -- via configured embedding provider
 9. **Summary generation** -- content-type-aware AI summary (non-blocking)
 10. **Database insert** -- upsert bookmark with embedding vector
 11. **Graph entity extraction** -- async, 2-minute timeout, fire-and-forget
-12. **Content chunking** -- async, for content >5000 chars, fire-and-forget
+12. **Content chunking** -- async, for content >24,000 chars (matching `ChunkingThreshold`), fire-and-forget
 
 ### Retry Policy
 
@@ -1040,7 +1154,7 @@ Before considering the implementation complete:
 
 - [x] All system invariants are explicit (INV-001 through INV-012)
 - [x] All behavioral properties are formally stated (PROP-001 through PROP-012)
-- [x] All interface contracts have precise schemas (12 endpoints documented)
+- [x] All interface contracts have precise schemas (14 endpoints documented)
 - [x] All functions have unambiguous behavior tables
 - [x] All boundary conditions have exact threshold values
 - [x] All error conditions are documented
@@ -1101,6 +1215,7 @@ This section documents the technology choices made in the initial implementation
 
 ## Version History
 
+- **v0.3.1** - Added missing contracts (related bookmarks, categories), defined RecentBookmark and autocomplete schemas, fixed chunking threshold inconsistency, added notes title resolution
 - **v0.3.0** - Abstracted technology references; added Original Implementation Reference section
 - **v0.2.0** - Added Web UI and Chrome Extension specification with UI invariants
 - **v0.1.0** - Initial specification extracted from existing codebase
