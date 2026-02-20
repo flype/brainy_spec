@@ -34,7 +34,3 @@ Following Fowler's framework, the test suite is organized by durability:
 1. **Durable evaluations** — Invariant checks, property-based tests, contract conformance, and end-to-end lifecycle tests. These survive reimplementation.
 2. **Ephemeral tests** — Example-based tests tied to specific implementation details. Disposable when the code changes.
 3. **Live evaluations** — Continuous production monitoring for drift detection, operational metrics, and business invariants.
-
-## Current version
-
-`v0.1.0`
