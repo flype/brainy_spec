@@ -21,6 +21,7 @@ Brainy Spec puts that idea into practice. Everything here — the system contrac
 
 Brainy is an async-first bookmark system with:
 
+- **Google Gemini AI** for embeddings, entity extraction, summaries, and answer generation
 - **Hybrid search** combining semantic (vector embeddings) and lexical (full-text) search
 - **Knowledge graph** (Neo4j) for entity extraction and discovery
 - **Graceful degradation** — optional subsystems can fail without blocking core functionality
