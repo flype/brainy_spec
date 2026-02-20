@@ -1,7 +1,7 @@
 version: "0.5.0"
 
 # Reference values:
-# - Embedding dimensions: 3072 (Gemini), 1536 (OpenAI)
+# - Embedding dimensions: 3072 (Google Gemini)
 # - Chunking threshold: 24000 chars
 # - Max chunk size: 4000 chars
 # - Chunk overlap: 400 chars
@@ -904,26 +904,15 @@ JobQueue:
 # -- Embedding Provider -------------------------------------------------------
 EmbeddingProvider:
   # DURABLE -- Dimension validation
-  - name: "boundary - OpenAI returns 1536 dimensions"
-    durability: durable
-    input: { provider: "openai", text: "Hello world" }
-    output: { dimensions: 1536 }
-
   - name: "boundary - Gemini returns 3072 dimensions"
     durability: durable
-    input: { provider: "gemini", text: "Hello world" }
+    input: { text: "Hello world" }
     output: { dimensions: 3072 }
 
   # DURABLE -- Long content handling
-  - name: "boundary - OpenAI truncates at 24000 chars"
-    durability: durable
-    input: { provider: "openai", text: "x repeated 30000 times" }
-    output: { embedding_generated: true, dimensions: 1536 }
-    note: "Content is summarized before embedding, not truncated at embed time"
-
   - name: "boundary - Gemini truncates at 80000 chars"
     durability: durable
-    input: { provider: "gemini", text: "x repeated 100000 times" }
+    input: { text: "x repeated 100000 times" }
     output: { embedding_generated: true, dimensions: 3072 }
 
 # -- SSE Answer Stream --------------------------------------------------------

@@ -6,7 +6,7 @@ Brainy is a single-user, personal bookmark knowledge base that ingests URLs from
 
 The system is designed to run on localhost or a private network with no authentication. All API endpoints are unauthenticated.
 
-The system processes bookmarks asynchronously through a job queue, supports multiple content platforms (YouTube, Twitter/X, Instagram, TikTok, generic web), detects paywalls with archive fallback, and provides multilingual search (English/Spanish) with configurable embedding providers.
+The system processes bookmarks asynchronously through a job queue, supports multiple content platforms (YouTube, Twitter/X, Instagram, TikTok, generic web), detects paywalls with archive fallback, and provides multilingual search (English/Spanish).
 
 ## Design Principles
 
@@ -44,7 +44,7 @@ Properties that must hold across ALL implementations, regardless of language, ar
 
 - **INV-008**: The `updated_at` timestamp on bookmarks auto-updates on every row modification via database trigger. *Rationale: consumers of bookmark data can rely on `updated_at` for change detection and cache invalidation.*
 
-- **INV-009**: Embedding vectors have exactly the dimensions configured for the active embedding provider. All vectors in the database use the same dimensionality. *Rationale: vector indexes require consistent dimensions for index operations and cosine similarity calculations.*
+- **INV-009**: Embedding vectors have exactly 3072 dimensions (Google Gemini). All vectors in the database use the same dimensionality. *Rationale: vector indexes require consistent dimensions for index operations and cosine similarity calculations.*
 
 - **INV-010**: In the knowledge graph, all entity nodes have dual labels: their specific type label (e.g., `:Person`) plus the generic `:Entity` label. Category and Concept nodes have only their respective single label. *Rationale: enables both type-specific and generic entity queries.*
 
@@ -1037,31 +1037,26 @@ When content exceeds the embedding provider's maximum input length, it is summar
 
 ---
 
-## Embedding Providers
+## Google AI Integration
 
-### Provider Abstraction
+### Embedding
 
-The system supports multiple embedding providers via a provider abstraction. Each provider must implement:
-- `GenerateEmbedding(text, taskType?) → vector` — generate an embedding vector for content
-- `GenerateChatCompletion(prompt, options?) → text` — generate text via a chat/completion model
-
-Provider configuration specifies:
-- **Dimensions**: The fixed vector length for the provider (must be consistent across all bookmarks)
-- **Max input length**: Character limit before content must be summarized or truncated
-- **Task types**: Whether the provider supports task-type hints (e.g., document vs. query embeddings)
+All embeddings use Google Gemini (`gemini-embedding-001`):
+- **Dimensions**: 3072
+- **Max input length**: 80,000 characters
+- **Task types**: Supports task-type hints (e.g., document vs. query embeddings)
 
 ### Long Content Handling
 
-- Content exceeding the provider's max input is summarized first, then the summary is embedded
+- Content exceeding 80,000 characters is summarized first, then the summary is embedded
 - If summarization input is very large, it is truncated using a head+tail strategy (first half + last half of the allowed range)
 - If summarization fails, intelligent truncation finds the last sentence boundary within the allowed range
 
 ### Chat Model Routing
 
 Dynamic model selection based on request characteristics:
-- Large or complex tasks (JSON extraction, long inputs): route to a more capable model
-- Small tasks: route to a faster/cheaper model
-- On server error with the primary model: fallback to the secondary model
+- Large or complex tasks (JSON extraction, long inputs): route to `gemini-2.5-pro`
+- Small tasks: route to `gemini-2.5-flash`
 - On structured output failure: retry without structured output constraints
 
 ---
@@ -1433,8 +1428,7 @@ This section documents the technology choices made in the initial implementation
 | Relational database | PostgreSQL | With pgvector extension for vector indexes |
 | Full-text search | PostgreSQL tsvector | `GENERATED ALWAYS` columns, `ts_rank_cd` for ranking |
 | Knowledge graph | Neo4j | Cypher queries, MERGE for idempotent node creation |
-| Embedding provider (primary) | Google Gemini `gemini-embedding-001` | 3072 dimensions, task-type support |
-| Embedding provider (secondary) | OpenAI `text-embedding-3-small` | 1536 dimensions |
+| Embedding provider | Google Gemini `gemini-embedding-001` | 3072 dimensions, task-type support |
 | Chat model (large) | Gemini `gemini-2.5-pro` | Used for complex extraction and long content |
 | Chat model (small) | Gemini `gemini-2.5-flash` | Used for summaries and small tasks |
 | Archive/paywall fallback | Tavily API | Retrieves archived versions of paywalled content |
