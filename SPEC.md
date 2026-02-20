@@ -1,4 +1,4 @@
-# Brainy - Smart Bookmark Vault Specification v0.4.0
+# Brainy - Smart Bookmark Vault Specification v0.5.0
 
 ## Overview
 
@@ -88,6 +88,14 @@ Universal truths about function behavior that hold for ALL valid inputs.
 - **PROP-011**: `cleanText`: Text cleaning is idempotent. Cleaning already-cleaned text produces identical output. *Formal: `cleanText(cleanText(text)) == cleanText(text)`*
 
 - **PROP-012**: `hybrid_search_bookmarks`: Results with score <= 0.01 are always filtered out. *Formal: `for all r in results: r.combined_score > 0.01`*
+
+- **PROP-013**: `GenerateContentSummary`: Content type determines summary format. YouTube content always produces timestamped outlines, articles always produce 5-section numbered structure, social media always produces 2-3 paragraphs. *Formal: `contentType == "youtube" => summary matches timestamped format` and `contentType in ("webpage", "article") => summary matches 5-section format` and `contentType in ("twitter", "tiktok") => paragraph_count(summary) <= 3`*
+
+- **PROP-014**: `GenerateContentSummary`: No summary output begins with preamble phrases. *Formal: `for all summaries s: !starts_with(s, "Here is") && !starts_with(s, "Of course") && !starts_with(s, "Sure") && !starts_with(s, "I've created") && !starts_with(s, "Below is")`*
+
+- **PROP-015**: `getSystemPromptForIntent`: Every non-command intent produces a system prompt that contains the base prompt as a prefix and includes citation `[N]` instructions. *Formal: `for all intents i where i != "command": starts_with(getSystemPromptForIntent(i), basePrompt) && contains(getSystemPromptForIntent(i), "[N]")`*
+
+- **PROP-016**: `buildContextTemplate`: The context template for N search results contains exactly N source blocks numbered `[1]` through `[N]`, and ends with the user's question. *Formal: `for i in 1..N: contains(context, "Source [" + i + "]")` and `ends_with(context, "User Question: " + query)`*
 
 ---
 
@@ -343,6 +351,9 @@ At least one of `url` or `notes` must be provided.
   } (optional, when graph service enabled)
 }
 ```
+
+**Contract invariants**:
+- When `graph_data` is present, all array fields (`categories`, `concepts`, `entities`, `topics`) MUST be empty arrays (`[]`), never `null`. Consumers rely on calling array methods (e.g., `.map()`) on these fields without null checks.
 
 ---
 
@@ -699,6 +710,109 @@ For large documents that have been chunked:
 
 ---
 
+## Answer Generation
+
+The `/answer` endpoint generates AI-powered answers to user questions using search results as context. The answer system uses a two-layer prompt architecture: a base system prompt shared across all intents, plus intent-specific suffixes that tailor the AI's behavior.
+
+### Base System Prompt
+
+All answer generation uses a shared base prompt that establishes the AI's role:
+
+```
+You are an advanced AI assistant with access to a comprehensive knowledge base of bookmarked web pages. You have been provided with complete bookmark content, metadata, and knowledge graph relationships.
+
+Key capabilities:
+- Analyze full document content (not just snippets)
+- Understand relationships between bookmarks through categories and concepts
+- Synthesize information across multiple sources
+- Provide nuanced, comprehensive answers
+
+When analyzing sources, note the relevance scores to prioritize highly relevant content.
+```
+
+### Intent-Specific System Prompts
+
+Each query intent appends a specific suffix to the base prompt that adjusts the AI's behavior and output format:
+
+| Intent | Format Requirements | Key Instructions |
+|--------|-------------------|------------------|
+| **Navigational** | Structured bookmark card format with emoji headers, source/category/date metadata, graph pills, related content | Present comprehensive bookmark detail with categories, concepts, entities, and platform-specific metadata. Use `## 📖 [Title](URL)` format with **Source**, **Category**, **Added** metadata line |
+| **Comparative** | Sections for each comparison aspect, tables when helpful, synthesis section | Read ALL sources thoroughly, use relevance scores, create comparison tables, include specific examples and quotes with `[N]` citations |
+| **Temporal** | Chronological or recency-based ordering | Focus on temporal aspect, prioritize newer content, highlight dates and time-sensitive information. Cite sources `[N]` |
+| **Conversational** | Natural conversational style | More casual tone, acknowledge connection to previous context. Inline citations `[N]` |
+| **Graph** | Group related bookmarks by categories/concepts with headers | Explain how bookmarks are related through shared categories, concepts, topics. Leverage graph metadata for richer context. Cite sources `[N]` |
+| **Informational** (default) | Markdown with bold, bullet points, code blocks, clear sections and headers | Thoroughly analyze full content, only cite relevant sources `[N]`, include specific details/examples/quotes, note metadata when relevant. Structure longer answers with headers |
+
+**Prompt invariants:**
+- All intents MUST include the base system prompt as prefix
+- All intents MUST instruct the AI to cite sources using `[N]` notation
+- The informational intent is the default when no other intent matches
+- Command intent does NOT use an LLM call — it returns a static help message
+
+### Context Template Format
+
+Search results are formatted into a structured context block that becomes the user prompt. Each source follows this format:
+
+```
+Here are the relevant bookmarks:
+
+[Optional: "Note: N related bookmarks are included based on shared categories/concepts."]
+
+=== Source [1] (Relevance Score: 0.892) ===
+Title: Example Article
+URL: https://example.com/article
+Added: 2025-06-15
+Metadata:
+  author: John Doe
+  duration: 45:30
+Content Type: article
+Language: en
+Categories: Technology, Web Development
+Concepts: React, Frontend Architecture
+Entities: React (Technology), Meta (Organization)
+Content:
+[full bookmark content]
+User Notes: Great reference for component patterns
+
+=== Source [2] (Relevance Score: 0.756) ===
+...
+
+User Question: [the user's original query]
+```
+
+**Context template invariants:**
+- Each source MUST include a `[N]` number matching the citation system
+- Each source MUST include the relevance score
+- Full content is included (not truncated), enabling deep analysis
+- Graph metadata (categories, concepts, entities) is included when the graph service is available
+- User notes are included when present
+- Metadata fields vary by content type (duration for video, author for articles, etc.)
+
+### Result Filtering
+
+Before building the context, search results are filtered:
+- Maximum 20 results included in the context
+- Results with score > 0.3 are included even beyond the 20-result limit
+- Results are ordered by combined score descending
+
+### Search Strategy Parameters
+
+Each intent configures different search behavior:
+
+| Intent | Semantic Weight | Lexical Weight | Max Results | Max Tokens | Special Behavior |
+|--------|----------------|----------------|-------------|------------|------------------|
+| URL-Specific | 0.1 | 0.9 | 1 | 50,000 | Graph search enabled (depth 3) |
+| Command | 0.0 | 0.0 | 0 | 0 | No search performed |
+| Conversational | 0.7 | 0.3 | 15 | 100,000 | No snippets |
+| Temporal | 0.5 | 0.5 | 20 | 50,000 | Boost recent content |
+| Graph | 0.4 | 0.1 | 20 | 150,000 | Graph search (depth 2-3) |
+| Comparative | 0.7 | 0.3 | 25 | 200,000 | More results for comparison |
+| Navigational | 0.3 | 0.7 | 20 | 50,000 | Boost exact matches |
+| Author-Specific | 0.4 | 0.6 | 30 | 100,000 | Boost lexical for names |
+| Informational | 0.6 | 0.4 | 20 | 100,000 | Default |
+
+---
+
 ## Content Chunking
 
 ### Configuration
@@ -768,18 +882,103 @@ Generated during bookmark ingestion (pipeline step 9) and during re-extraction. 
 
 The AI prompt strategy and output budget vary by content type:
 
-| Content Type | Prompt Strategy | Max Output Tokens |
-|---|---|---|
-| `youtube` | Timestamped structured outline with MM:SS format, section headers, speaker attributions, key points per section | 4000-8000 |
-| `twitter` / `tiktok` | Main message, key facts, context, and tone in 2-3 paragraphs | 1000 |
-| `article` / `webpage` | 5-section structure: Main Topic, Key Points, Important Details, Conclusions, Relevance | 2000-8000 |
-| default | Generic: main topic, key points, technical info, conclusions | 2000-8000 |
+| Content Type | Prompt Strategy | Max Output Tokens | Temperature |
+|---|---|---|---|
+| `youtube` | Timestamped structured outline (see format below) | 4000-8000 | 0.5 |
+| `twitter` / `tiktok` | Main message, key facts, context, and tone in 2-3 paragraphs | 1000 | 0.5 |
+| `article` / `webpage` | 5-section numbered structure (see format below) | 2000-8000 | 0.5 |
+| default | Generic: main topic, key points, technical info, conclusions | 2000-8000 | 0.5 |
 
-**Behavioral rules:**
+#### YouTube Summary Format
+
+YouTube summaries must produce a **navigable index** of the video transcript with the following structure:
+
+1. **Title**: A descriptive title capturing the main theme of the video
+2. **Timestamped sections** organized by major topic transitions:
+   - Timestamps in `MM:SS` format (aim for 5-10 minute segments)
+   - Clear section headers at each topic transition
+   - Under each timestamp: the main topic/question discussed, key assertions, specific examples or references mentioned
+   - Speaker attributions for important statements (e.g., "Ross asserts...")
+   - Bullet points for sub-topics within sections
+   - Brief "Related reading" notes where relevant topics are mentioned
+
+**Expected output structure:**
+```
+[Descriptive Title]
+
+00:00 [Section Title]
+[Brief context or related reading]
+
+[Key question discussed or main assertion]
+
+• Point 1
+• Point 2
+• Specific example or reference mentioned
+
+08:30 [Next Section Title]
+[Main topic/question for this section]
+
+[Speaker] asserts...
+• Point 1
+• Point 2
+
+...
+```
+
+**YouTube format invariants:**
+- MUST contain at least one timestamp in `MM:SS` format
+- MUST start directly with the title (no preamble)
+- Each timestamp section MUST have a section header in brackets
+- Timestamps MUST appear in chronological order
+
+#### Article / Webpage Summary Format
+
+Article summaries must produce a **5-section numbered structure**:
+
+```
+1. **Main Topic**: What is this article about?
+2. **Key Points**: 3-5 main arguments or findings
+3. **Important Details**: Specific facts, figures, or examples that support the main points
+4. **Conclusions**: What conclusions does the author draw?
+5. **Relevance**: Why is this information important or useful?
+```
+
+**Article format invariants:**
+- MUST contain exactly 5 numbered sections in the specified order
+- MUST start directly with `1. **Main Topic**:` (no preamble)
+- Section 2 (Key Points) MUST contain 3-5 bullet points
+- Technical details, names, dates, and specific information MUST be preserved
+
+#### Social Media Summary Format (Twitter / TikTok)
+
+Social media summaries must capture:
+- The main message or point being made
+- Key facts, claims, or insights
+- Any important context or references
+- The overall tone and purpose
+
+**Social media format invariants:**
+- MUST be 2-3 paragraphs maximum
+- MUST start directly with summary content (no preamble)
+- MUST preserve all important information from the original post
+
+#### Default Summary Format
+
+For content that doesn't match a specific type, summaries must:
+- Identify the main topic or purpose
+- List key points and important details
+- Preserve technical information, names, and specific facts
+- Highlight any conclusions or recommendations
+
+**Default format invariants:**
+- MUST start directly with summary content (no preamble)
+- MUST be concise while covering all key information
+
+**Behavioral rules (all content types):**
 - Content type is determined by the same URL detection used in the ingestion pipeline (see [Content Type Detection](#content-type-detection))
 - If summary generation fails, the error is logged and the bookmark is created with a null/empty summary
 - On re-extraction, if summary generation fails, the existing summary is preserved (null-coalescing update)
-- Summary output should begin directly with content (no preamble like "Here is a summary...")
+- Summary output MUST begin directly with content — never with introductory phrases like "Here is a summary...", "Of course, here is...", "Sure! Here's...", or similar preamble. This is enforced via prompt instructions.
 
 ### Path 2: Summarize-Then-Embed (Transient)
 
@@ -887,7 +1086,7 @@ The web UI is a single-page application served as a static HTML file by the back
 
 ### Views
 
-The application has four primary views, switched via a sticky header navigation bar:
+The application has three primary views, switched via a sticky header navigation bar:
 
 | View | Purpose | Key Interactions |
 |------|---------|-----------------|
@@ -1211,7 +1410,7 @@ Before considering the implementation complete:
 ## Regeneration Confidence Checklist
 
 - [x] All system invariants are explicit (INV-001 through INV-012)
-- [x] All behavioral properties are formally stated (PROP-001 through PROP-012)
+- [x] All behavioral properties are formally stated (PROP-001 through PROP-016)
 - [x] All interface contracts have precise schemas (14 endpoints documented)
 - [x] All functions have unambiguous behavior tables
 - [x] All boundary conditions have exact threshold values
@@ -1234,7 +1433,7 @@ This section documents the technology choices made in the initial implementation
 | Relational database | PostgreSQL | With pgvector extension for vector indexes |
 | Full-text search | PostgreSQL tsvector | `GENERATED ALWAYS` columns, `ts_rank_cd` for ranking |
 | Knowledge graph | Neo4j | Cypher queries, MERGE for idempotent node creation |
-| Embedding provider (primary) | Google Gemini `text-embedding-004` | 3072 dimensions, task-type support |
+| Embedding provider (primary) | Google Gemini `gemini-embedding-001` | 3072 dimensions, task-type support |
 | Embedding provider (secondary) | OpenAI `text-embedding-3-small` | 1536 dimensions |
 | Chat model (large) | Gemini `gemini-2.5-pro` | Used for complex extraction and long content |
 | Chat model (small) | Gemini `gemini-2.5-flash` | Used for summaries and small tasks |
@@ -1273,6 +1472,7 @@ This section documents the technology choices made in the initial implementation
 
 ## Version History
 
+- **v0.5.0** - Added precise summary output format templates (YouTube timestamped index, article 5-section structure, social media 2-3 paragraph), added Answer Generation section with intent-specific system prompts, context template format, result filtering rules, and search strategy parameters. Added PROP-013 through PROP-016 for summary format and prompt behavior. Added SummaryGeneration and AnswerGeneration test sections.
 - **v0.4.0** - Clarified single-user auth model, documented search path switching (language detection), standardized Job Status to snake_case, added metadata schema per content type, documented snippet generation, clarified content cleaning scope (archive-only), documented re-extract full regeneration scope, documented content-type-specific summary prompts, clarified total sentinel -2 threshold, documented nodes[] graph filtering mechanism, documented related bookmarks score field, marked Analysis Mode as not yet specced
 - **v0.3.2** - Added Summary Generation section with content-type-aware strategies and summarize-then-embed path
 - **v0.3.1** - Added missing contracts (related bookmarks, categories), defined RecentBookmark and autocomplete schemas, fixed chunking threshold inconsistency, added notes title resolution

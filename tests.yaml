@@ -1,4 +1,4 @@
-version: "0.4.0"
+version: "0.5.0"
 
 # Reference values:
 # - Embedding dimensions: 3072 (Gemini), 1536 (OpenAI)
@@ -134,6 +134,26 @@ properties:
     functions: [hybrid_search_bookmarks]
     for_all: { embedding: "valid vector", query: "non-empty string" }
     property: "for all results r: r.combined_score > 0.01"
+
+  - name: "property - summary format determined by content type"
+    functions: [GenerateContentSummary]
+    for_all: { content: "non-empty string", content_type: "valid content type" }
+    property: "content_type == 'youtube' => summary contains MM:SS timestamps AND content_type in ('webpage', 'article') => summary starts with '1. **Main Topic**' AND content_type in ('twitter', 'tiktok') => paragraph_count(summary) <= 3"
+
+  - name: "property - summary never starts with preamble"
+    functions: [GenerateContentSummary]
+    for_all: { content: "non-empty string", content_type: "valid content type" }
+    property: "!starts_with(summary, 'Here is') && !starts_with(summary, 'Of course') && !starts_with(summary, 'Sure') && !starts_with(summary, 'I\\'ve created') && !starts_with(summary, 'Below is')"
+
+  - name: "property - all non-command intents include base prompt and citation instructions"
+    functions: [getSystemPromptForIntent]
+    for_all: { intent: "any intent except 'command'" }
+    property: "starts_with(prompt, basePrompt) && contains(prompt, '[N]')"
+
+  - name: "property - context template has numbered sources and ends with question"
+    functions: [buildContextTemplate]
+    for_all: { results: "array of N search results", query: "non-empty string" }
+    property: "for i in 1..N: contains(context, 'Source [' + i + ']') AND ends_with(context, 'User Question: ' + query)"
 
 # =============================================================================
 # INTERFACE CONTRACTS -- HTTP endpoint schema conformance
@@ -277,6 +297,12 @@ contracts:
         content: { type: "string" }
         read_status: { type: "boolean" }
         created_at: { type: "string" }
+
+  - name: "contract - GET /bookmark/detail graph_data arrays never null"
+    endpoint: "GET /bookmark/detail"
+    direction: response
+    status: 200
+    property: "when graph_data is present, categories/concepts/entities/topics are always [] (empty array), never null"
 
 # =============================================================================
 # FUNCTION EVALUATIONS -- Per-function behavioral checks
@@ -639,6 +665,13 @@ GetBookmarkDetail:
     input: { id: "non-existent-uuid" }
     output: { status: 404 }
 
+  - name: "boundary - graph_data arrays are never null"
+    durability: durable
+    input: { id: "bookmark-with-no-graph-data" }
+    precondition: "bookmark exists but has no graph entities"
+    output: { status: 200, graph_data.categories: [], graph_data.concepts: [], graph_data.entities: [], graph_data.topics: [] }
+    note: "Array fields must serialize as [] not null, so consumers can safely call .map() without null checks"
+
 # -- Toggle Read Status API ---------------------------------------------------
 ToggleReadStatus:
   # DURABLE -- Toggle behavior
@@ -915,6 +948,228 @@ AnswerQuestion:
     durability: durable
     input: { q: "help" }
     output: { no_search_performed: true, contains_help_text: true }
+
+# -- Summary Generation -------------------------------------------------------
+SummaryGeneration:
+  # DURABLE -- YouTube summary format
+  - name: "boundary - YouTube summary contains timestamps in MM:SS format"
+    durability: durable
+    input: { content_type: "youtube", content: "video transcript with multiple topics" }
+    output: { contains_timestamp_pattern: "\\d{1,2}:\\d{2}", timestamp_count_gte: 1 }
+
+  - name: "boundary - YouTube summary starts with title (no preamble)"
+    durability: durable
+    input: { content_type: "youtube", content: "video transcript" }
+    output: { does_not_start_with: ["Here is", "Of course", "Sure", "I've created", "Below is"] }
+
+  - name: "boundary - YouTube summary has section headers in brackets"
+    durability: durable
+    input: { content_type: "youtube", content: "video transcript with topic changes" }
+    output: { contains_pattern: "\\d{1,2}:\\d{2}\\s+\\[.+\\]" }
+
+  - name: "boundary - YouTube summary timestamps are chronologically ordered"
+    durability: durable
+    input: { content_type: "youtube", content: "long video transcript" }
+    output: { timestamps_chronologically_ordered: true }
+
+  # DURABLE -- Article summary format
+  - name: "boundary - article summary has 5 numbered sections"
+    durability: durable
+    input: { content_type: "webpage", content: "long article about technology" }
+    output: { contains_sections: ["1. **Main Topic**", "2. **Key Points**", "3. **Important Details**", "4. **Conclusions**", "5. **Relevance**"] }
+
+  - name: "boundary - article summary starts with Main Topic section (no preamble)"
+    durability: durable
+    input: { content_type: "webpage", content: "article content" }
+    output: { starts_with: "1. **Main Topic**", does_not_start_with: ["Here is", "Of course", "Sure", "I've created", "Below is"] }
+
+  - name: "boundary - article Key Points section has 3-5 bullet items"
+    durability: durable
+    input: { content_type: "webpage", content: "detailed article" }
+    output: { key_points_bullet_count_gte: 3, key_points_bullet_count_lte: 5 }
+
+  # DURABLE -- Social media summary format
+  - name: "boundary - twitter summary is 2-3 paragraphs max"
+    durability: durable
+    input: { content_type: "twitter", content: "tweet thread content" }
+    output: { paragraph_count_lte: 3, paragraph_count_gte: 1 }
+
+  - name: "boundary - tiktok summary is 2-3 paragraphs max"
+    durability: durable
+    input: { content_type: "tiktok", content: "tiktok video description" }
+    output: { paragraph_count_lte: 3, paragraph_count_gte: 1 }
+
+  - name: "boundary - social media summary starts directly (no preamble)"
+    durability: durable
+    input: { content_type: "twitter", content: "tweet content" }
+    output: { does_not_start_with: ["Here is", "Of course", "Sure", "I've created", "Below is"] }
+
+  # DURABLE -- General behavioral rules
+  - name: "boundary - summary generation failure does not block bookmark creation"
+    durability: durable
+    input: { content_type: "webpage", content: "article", summary_generation_fails: true }
+    output: { bookmark_created: true, summary: null }
+
+  - name: "boundary - re-extraction preserves existing summary on failure"
+    durability: durable
+    input: { id: "bookmark-with-summary", summary_generation_fails: true }
+    precondition: "bookmark has summary='Existing summary text'"
+    output: { summary: "Existing summary text" }
+
+  - name: "boundary - content type routing uses URL detection"
+    durability: durable
+    input: { url: "https://www.youtube.com/watch?v=abc123", content: "transcript" }
+    output: { summary_format: "youtube_timestamped" }
+
+  - name: "boundary - content type routing for webpage"
+    durability: durable
+    input: { url: "https://example.com/article", content: "article text" }
+    output: { summary_format: "article_5_section" }
+
+  # DURABLE -- Token limits per content type
+  - name: "boundary - YouTube summary max tokens is 4000-8000"
+    durability: durable
+    input: { content_type: "youtube" }
+    output: { max_tokens_gte: 4000, max_tokens_lte: 8000 }
+
+  - name: "boundary - social media summary max tokens is 1000"
+    durability: durable
+    input: { content_type: "twitter" }
+    output: { max_tokens: 1000 }
+
+  - name: "boundary - article summary max tokens is 2000-8000"
+    durability: durable
+    input: { content_type: "webpage" }
+    output: { max_tokens_gte: 2000, max_tokens_lte: 8000 }
+
+  # EPHEMERAL -- Format examples
+  - name: "example - YouTube summary includes speaker attributions"
+    durability: ephemeral
+    input: { content_type: "youtube", content: "transcript with multiple speakers" }
+    output: { contains_speaker_attribution: true }
+
+  - name: "example - article summary preserves technical details"
+    durability: ephemeral
+    input: { content_type: "webpage", content: "article about React 19 with code examples" }
+    output: { summary_contains_technical_terms: true }
+
+  - name: "example - default content type uses generic summary format"
+    durability: ephemeral
+    input: { content_type: "unknown", content: "generic content" }
+    output: { does_not_start_with: ["Here is", "Of course", "Sure"] }
+
+# -- Answer Generation (Prompt System) ----------------------------------------
+AnswerGeneration:
+  # DURABLE -- Intent-specific prompt selection
+  - name: "boundary - navigational intent uses navigational system prompt"
+    durability: durable
+    input: { query: "find that golang article", intent: "navigational" }
+    output: { system_prompt_contains: "looking for a specific bookmark", system_prompt_contains_base: true }
+
+  - name: "boundary - comparative intent uses comparative system prompt"
+    durability: durable
+    input: { query: "compare React vs Vue", intent: "comparative" }
+    output: { system_prompt_contains: "compare different bookmarks", system_prompt_contains_base: true }
+
+  - name: "boundary - temporal intent uses temporal system prompt"
+    durability: durable
+    input: { query: "recent bookmarks", intent: "temporal" }
+    output: { system_prompt_contains: "recent bookmarks or time-specific content", system_prompt_contains_base: true }
+
+  - name: "boundary - conversational intent uses conversational system prompt"
+    durability: durable
+    input: { query: "tell me more", intent: "conversational" }
+    output: { system_prompt_contains: "follow-up question or conversational query", system_prompt_contains_base: true }
+
+  - name: "boundary - graph intent uses graph system prompt"
+    durability: durable
+    input: { query: "bookmarks about machine learning", intent: "graph" }
+    output: { system_prompt_contains: "knowledge graph", system_prompt_contains_base: true }
+
+  - name: "boundary - informational intent uses default system prompt"
+    durability: durable
+    input: { query: "what are microservices", intent: "informational" }
+    output: { system_prompt_contains: "COMPLETE CONTENT", system_prompt_contains_base: true }
+
+  - name: "boundary - command intent does not invoke LLM"
+    durability: durable
+    input: { query: "help", intent: "command" }
+    output: { llm_invoked: false, static_response: true }
+
+  - name: "boundary - all intents include base system prompt"
+    durability: durable
+    input: { intent: "any non-command intent" }
+    output: { system_prompt_starts_with: "You are an advanced AI assistant" }
+
+  # DURABLE -- Context template structure
+  - name: "boundary - context template includes source numbers"
+    durability: durable
+    input: { search_results: "3 results" }
+    output: { context_contains: ["=== Source [1]", "=== Source [2]", "=== Source [3]"] }
+
+  - name: "boundary - context template includes relevance scores"
+    durability: durable
+    input: { search_results: "results with scores" }
+    output: { context_matches_pattern: "Relevance Score: \\d+\\.\\d+" }
+
+  - name: "boundary - context template includes full content"
+    durability: durable
+    input: { search_results: "results with content" }
+    output: { each_source_has_content_field: true, content_not_truncated: true }
+
+  - name: "boundary - context template includes graph metadata when available"
+    durability: durable
+    input: { search_results: "results", graph_service: "enabled" }
+    output: { context_contains_categories: true, context_contains_concepts: true, context_contains_entities: true }
+
+  - name: "boundary - context ends with user question"
+    durability: durable
+    input: { query: "what is React", search_results: "results" }
+    output: { context_ends_with: "User Question: what is React" }
+
+  # DURABLE -- Result filtering
+  - name: "boundary - maximum 20 results in context by default"
+    durability: durable
+    input: { search_results: "50 results with varied scores" }
+    output: { context_source_count_lte: 20 }
+    note: "Results with score > 0.3 may exceed 20"
+
+  - name: "boundary - high-score results included beyond 20 limit"
+    durability: durable
+    input: { search_results: "25 results all with score > 0.5" }
+    output: { context_source_count: 25 }
+
+  # DURABLE -- All intents require citation notation
+  - name: "boundary - all non-command intents instruct citation [N] notation"
+    durability: durable
+    input: { intent: "any non-command intent" }
+    output: { system_prompt_contains_citation_instruction: true }
+
+  # EPHEMERAL -- Search strategy parameters
+  - name: "example - navigational intent boosts lexical weight"
+    durability: ephemeral
+    input: { intent: "navigational" }
+    output: { semantic_weight: 0.3, lexical_weight: 0.7 }
+
+  - name: "example - comparative intent retrieves more results"
+    durability: ephemeral
+    input: { intent: "comparative" }
+    output: { max_results: 25, max_tokens: 200000 }
+
+  - name: "example - author-specific intent uses higher lexical weight"
+    durability: ephemeral
+    input: { intent: "author_specific" }
+    output: { semantic_weight: 0.4, lexical_weight: 0.6, max_results: 30 }
+
+  - name: "example - context includes user notes when present"
+    durability: ephemeral
+    input: { search_results: "result with user notes" }
+    output: { context_contains: "User Notes:" }
+
+  - name: "example - context includes metadata fields"
+    durability: ephemeral
+    input: { search_results: "youtube result with duration metadata" }
+    output: { context_contains: "duration:" }
 
 # -- Thumbnail Extraction -----------------------------------------------------
 ThumbnailExtraction:
