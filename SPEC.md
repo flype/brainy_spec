@@ -1,4 +1,4 @@
-# Brainy - Smart Bookmark Vault Specification v0.5.0
+# Brainy - Smart Bookmark Vault Specification v0.5.1
 
 ## Overview
 
@@ -1466,6 +1466,7 @@ This section documents the technology choices made in the initial implementation
 
 ## Version History
 
+- **v0.5.1** - Removed dual embedding provider abstraction and OpenAI secondary provider. All embeddings and chat completions now use Google Gemini exclusively with concrete model references and fixed 3072 dimensions.
 - **v0.5.0** - Added precise summary output format templates (YouTube timestamped index, article 5-section structure, social media 2-3 paragraph), added Answer Generation section with intent-specific system prompts, context template format, result filtering rules, and search strategy parameters. Added PROP-013 through PROP-016 for summary format and prompt behavior. Added SummaryGeneration and AnswerGeneration test sections.
 - **v0.4.0** - Clarified single-user auth model, documented search path switching (language detection), standardized Job Status to snake_case, added metadata schema per content type, documented snippet generation, clarified content cleaning scope (archive-only), documented re-extract full regeneration scope, documented content-type-specific summary prompts, clarified total sentinel -2 threshold, documented nodes[] graph filtering mechanism, documented related bookmarks score field, marked Analysis Mode as not yet specced
 - **v0.3.2** - Added Summary Generation section with content-type-aware strategies and summarize-then-embed path
