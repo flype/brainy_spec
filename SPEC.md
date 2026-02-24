@@ -1,4 +1,4 @@
-# Brainy - Smart Bookmark Vault Specification v0.6.0
+# Brainy - Smart Bookmark Vault Specification v0.6.1
 
 ## Overview
 
@@ -6,7 +6,7 @@ Brainy is a single-user, personal bookmark knowledge base that ingests URLs from
 
 The system is designed to run on localhost or a private network with no authentication. All API endpoints are unauthenticated.
 
-The system processes bookmarks asynchronously through a job queue, supports multiple content platforms (YouTube, Twitter/X, Instagram, TikTok, generic web), detects paywalls with archive fallback, and provides multilingual search (English/Spanish).
+The system processes bookmarks asynchronously through a job queue, supports multiple content platforms (YouTube, Twitter/X, Instagram, TikTok, generic web), detects paywalls with archive fallback, and provides multilingual search (English/Spanish) with configurable embedding providers.
 
 ## Design Principles
 
@@ -44,13 +44,19 @@ Properties that must hold across ALL implementations, regardless of language, ar
 
 - **INV-008**: The `updated_at` timestamp on bookmarks auto-updates on every row modification via database trigger. *Rationale: consumers of bookmark data can rely on `updated_at` for change detection and cache invalidation.*
 
-- **INV-009**: Embedding vectors have exactly 3072 dimensions (Google Gemini). All vectors in the database use the same dimensionality. *Rationale: vector indexes require consistent dimensions for index operations and cosine similarity calculations.*
+- **INV-009**: Embedding vectors have exactly the dimensions configured for the active embedding provider. All vectors in the database use the same dimensionality. *Rationale: vector indexes require consistent dimensions for index operations and cosine similarity calculations.*
 
 - **INV-010**: In the knowledge graph, all entity nodes have dual labels: their specific type label (e.g., `:Person`) plus the generic `:Entity` label. Category and Concept nodes have only their respective single label. *Rationale: enables both type-specific and generic entity queries.*
 
 - **INV-011**: Graph node creation uses MERGE (not CREATE) keyed on `name` for categories/concepts/entities and on `id` for bookmarks. This prevents duplicate graph nodes. *Rationale: idempotent graph operations are essential for retry safety and re-indexing.*
 
 - **INV-012**: When a bookmark is deleted from the graph, any category/concept/entity nodes that become orphaned (no remaining relationships) are also deleted. *Rationale: prevents graph pollution with disconnected nodes that no longer relate to any bookmark.*
+
+- **INV-013**: Knowledge graph highlight spans (`<span class="kg-highlight">`) are never placed inside `<code>`, `<pre>`, `<script>`, `<style>`, or `<sup>` elements. *Rationale: highlighting inside code blocks would corrupt code examples; highlighting inside `<sup>` would break citation references.*
+
+- **INV-014**: Every citation event sent via SSE corresponds to a `[N]` reference that actually appears in the LLM-generated answer text. Citation events are never sent for sources the LLM did not cite. *Rationale: showing unused sources would confuse users and undermine trust in the citation system.*
+
+- **INV-015**: The knowledge graph type-to-color mapping is consistent across all UI surfaces (answer highlighting, citation pills, detail modal pills, autocomplete pills). Categories are always blue, concepts are always green, entities are always orange. *Rationale: users learn the color coding once and rely on it everywhere.*
 
 ### Verification
 
@@ -89,13 +95,27 @@ Universal truths about function behavior that hold for ALL valid inputs.
 
 - **PROP-012**: `hybrid_search_bookmarks`: Results with score <= 0.01 are always filtered out. *Formal: `for all r in results: r.combined_score > 0.01`*
 
-- **PROP-013**: `GenerateContentSummary`: Content type determines summary format. YouTube content always produces timestamped outlines, articles always produce 5-section numbered structure, social media always produces 2-3 paragraphs. *Formal: `contentType == "youtube" => summary matches timestamped format` and `contentType in ("webpage", "article") => summary matches 5-section format` and `contentType in ("twitter", "tiktok") => paragraph_count(summary) <= 3`*
+- **PROP-013**: `GenerateContentSummary`: Content type determines summary format. YouTube content always produces a descriptive title, introductory paragraph, and timestamped outlines in the content's language. Articles always produce 5-section numbered structure. Social media always produces 2-3 paragraphs. *Formal: `contentType == "youtube" => summary has title + intro paragraph + timestamps in MM:SS or HH:MM:SS` and `contentType in ("webpage", "article") => summary matches 5-section format` and `contentType in ("twitter", "tiktok") => paragraph_count(summary) <= 3`*
 
 - **PROP-014**: `GenerateContentSummary`: No summary output begins with preamble phrases. *Formal: `for all summaries s: !starts_with(s, "Here is") && !starts_with(s, "Of course") && !starts_with(s, "Sure") && !starts_with(s, "I've created") && !starts_with(s, "Below is")`*
+
+- **PROP-023**: `GenerateContentSummary`: Summary language matches content language. When the input content is in a specific language, the summary output is in that same language. *Formal: `detected_language(content) == detected_language(summary)` for all content types*
 
 - **PROP-015**: `getSystemPromptForIntent`: Every non-command intent produces a system prompt that contains the base prompt as a prefix and includes citation `[N]` instructions. *Formal: `for all intents i where i != "command": starts_with(getSystemPromptForIntent(i), basePrompt) && contains(getSystemPromptForIntent(i), "[N]")`*
 
 - **PROP-016**: `buildContextTemplate`: The context template for N search results contains exactly N source blocks numbered `[1]` through `[N]`, and ends with the user's question. *Formal: `for i in 1..N: contains(context, "Source [" + i + "]")` and `ends_with(context, "User Question: " + query)`*
+
+- **PROP-017**: `extractCitedNumbers`: Returns only unique citation numbers that appear as `[N]` in the text, in order of first appearance. *Formal: `for all n in extractCitedNumbers(text): text contains "[" + n + "]"` and `len(extractCitedNumbers(text)) == len(set(extractCitedNumbers(text)))`*
+
+- **PROP-018**: `formatAnswer`: Every `[N]` pattern in the input markdown is transformed into a `<sup>` element containing an `<a>` link targeting `#citation-N`. No `[N]` patterns remain as plain text in the output. *Formal: `count("[N]" in formatAnswer(text)) == 0` and `count("<sup>...[N]...</sup>" in formatAnswer(text)) == count("[N]" in text)`*
+
+- **PROP-019**: `highlightTextNodes`: Highlighted spans never overlap. When two knowledge graph terms would overlap in the text, only the longer match is kept. If lengths are equal, entity > concept > category priority applies. *Formal: `for all spans s1, s2 in highlights: s1.range ∩ s2.range == ∅`*
+
+- **PROP-020**: `highlightTextNodes`: Idempotent. Running the highlighting algorithm on already-highlighted content produces no additional spans (because `.kg-highlight` elements are in the exclusion list). *Formal: `highlightTextNodes(highlightTextNodes(element, terms), terms) == highlightTextNodes(element, terms)`*
+
+- **PROP-021**: `renderContentPreview`: Content that matches any of the 11 markdown detection patterns is rendered via `marked.parse()`. Content that matches none is rendered with manual paragraph splitting and bold conversion. *Formal: `isMarkdown(content) => output contains "<div class=\"markdown-content\">"` and `!isMarkdown(content) => output contains "<p class=\"mb-4\">"}`*
+
+- **PROP-022**: `getSnippet`: Snippets are always ≤ 200 characters (plus "..." suffix when truncated). Content is preferred over notes as the snippet source. *Formal: `len(snippet) <= 203` and `content != "" => snippet derived from content`*
 
 ---
 
@@ -813,6 +833,244 @@ Each intent configures different search behavior:
 
 ---
 
+## Answer Rendering Pipeline
+
+The answer rendering pipeline transforms the raw LLM-generated markdown stream into a rich, interactive HTML experience. The pipeline has four sequential stages, each building on the previous one's output.
+
+### Stage 1: Markdown Rendering
+
+Raw answer text (received as SSE chunks) is rendered to HTML using a GFM-compliant markdown parser.
+
+**Parser configuration:**
+
+| Setting | Value | Rationale |
+|---------|-------|-----------|
+| `breaks` | `true` | Convert single `\n` to `<br>` for line-level formatting |
+| `gfm` | `true` | Support GitHub-Flavored Markdown (tables, strikethrough, task lists) |
+| `smartLists` | `true` | Better list formatting with mixed numbering |
+| `smartypants` | `true` | Typographic quotes and dashes |
+| `sanitize` | `false` | Allow HTML passthrough (required for downstream processing) |
+
+**Newline handling for SSE streams:** Streaming responses encode newlines as literal `\n` escape sequences within SSE `data:` fields. The client decodes these (`\\n` → `\n`) before markdown parsing. For non-streaming responses (line-by-line SSE events), the client inserts newlines between events unless the accumulated text already ends with a newline.
+
+**Error fallback:** If the markdown parser is unavailable or throws an error, the answer is displayed as HTML-escaped plain text (`<` → `&lt;`, `>` → `&gt;`).
+
+### Stage 2: Citation Transformation
+
+After markdown rendering, all `[N]` patterns in the HTML are transformed into interactive citation links.
+
+**Transformation:**
+```
+[N] → <sup class="text-blue-600 font-semibold">
+        <a href="#citation-N" onclick="scrollToCitation(N)">[N]</a>
+      </sup>
+```
+
+**Citation click behavior:**
+1. Smooth-scroll the citation card (`#citation-N`) into the viewport center
+2. Add a blue ring highlight (`ring-2 ring-blue-500 ring-offset-2`) to the card
+3. Remove the ring highlight after 2 seconds
+
+**Citation card rendering:**
+
+Citation cards appear in a "Sources" section below the answer. Each card contains:
+
+| Element | Display | Behavior |
+|---------|---------|----------|
+| Number badge | Blue circle with citation number | Visual anchor |
+| Thumbnail | 128×80 image from metadata, with fallback icon | Platform-aware |
+| Title | Bookmark title, truncated | Clickable → opens detail modal |
+| URL | Truncated to 100 chars with external link icon | Opens in new tab |
+| Category pills | Blue rounded badges | Clickable → triggers related bookmark search |
+| Concept pills | Green rounded badges | Clickable → triggers related bookmark search |
+| Entity pills | Orange rounded badges with type label | Clickable → triggers related bookmark search |
+| YouTube metadata | Channel name + duration (when applicable) | With red video icon |
+| Date | Creation date | Static display |
+
+**Citation filtering invariant:** Only sources whose `[N]` number appears in the LLM response text are rendered as citation cards. The backend extracts cited numbers via regex `\[(\d+)\]`, deduplicates them, and only sends citation SSE events for matched sources.
+
+### Stage 3: Knowledge Graph Term Highlighting
+
+After the answer is fully rendered (streaming complete), knowledge graph terms are overlaid as interactive highlights on the rendered HTML. See [Knowledge Graph Term Highlighting](#knowledge-graph-term-highlighting) for the full specification.
+
+### Stage 4: Markdown CSS Styling
+
+All rendered markdown content (answers, summaries, content previews) is styled via a `.markdown-content` CSS class that provides consistent typography:
+
+| Element | Style |
+|---------|-------|
+| Body text | 1rem, line-height 1.75, gray-700 |
+| `h1` | 1.875rem bold, gray-900 |
+| `h2` | 1.5rem bold, gray-800 |
+| `h3` | 1.25rem semibold, gray-800 |
+| `strong`/`b` | font-weight 700, gray-900 (#111827) |
+| `em` | Italic, gray-600 |
+| Inline `code` | Gray-100 background, monospace, red-600 text |
+| Code blocks (`pre`) | Dark background (#1f2937), gray-100 text, rounded |
+| `blockquote` | Left blue border (4px), italic, gray-700 |
+| Tables | Full-width, collapsed borders, alternating row shading |
+| Links | Blue-600, underlined, darker on hover |
+| `sup` (citations) | 0.75em, vertical-align super, bold blue links |
+| Lists | Proper indentation (ml-6), disc/decimal markers, spacing |
+| Images | Rounded, shadow, responsive max-width |
+
+---
+
+## Knowledge Graph Term Highlighting
+
+After an answer finishes streaming, the system scans the rendered HTML for known knowledge graph terms (categories, concepts, entities) and wraps matching text in interactive, color-coded highlight spans. This provides a discovery layer that connects the AI-generated answer back to the user's bookmark collection.
+
+### Term Data Source
+
+Terms are loaded from `GET /knowledge-terms` and cached client-side with a 5-minute TTL. The response contains three arrays:
+
+```
+{
+  "categories": [{ "name": string, "count": integer }],
+  "concepts": [{ "name": string, "count": integer }],
+  "entities": [{ "name": string, "type": string, "count": integer }]
+}
+```
+
+### Color System
+
+The knowledge graph type-to-color mapping is consistent across all UI surfaces:
+
+| Type | Background | Text | Border | Icon | Usage |
+|------|-----------|------|--------|------|-------|
+| Category | `bg-blue-100` | `text-blue-700` | `border-blue-300` | 📁 | Answer highlights, citation pills, detail pills, autocomplete |
+| Concept | `bg-green-100` | `text-green-700` | `border-green-300` | 💡 | Answer highlights, citation pills, detail pills, autocomplete |
+| Entity | `bg-orange-100` | `text-orange-700` | `border-orange-300` | 🏷️ | Answer highlights, citation pills, detail pills, autocomplete |
+| Topic | `bg-purple-100` | `text-purple-700` | — | — | Autocomplete pills, detail modal pills |
+| Person | `bg-orange-100` | `text-orange-700` | — | — | Autocomplete pills (entity subtype) |
+| Organization | `bg-red-100` | `text-red-700` | — | — | Autocomplete pills (entity subtype) |
+| Technology | `bg-indigo-100` | `text-indigo-700` | — | — | Autocomplete pills (entity subtype) |
+| Project | `bg-pink-100` | `text-pink-700` | — | — | Autocomplete pills (entity subtype) |
+
+### Highlighting Algorithm
+
+The highlighting operates on the DOM (not on HTML strings) to avoid corrupting markup:
+
+1. **Collect text nodes:** Use a `TreeWalker` (filter: `SHOW_TEXT`) to find all text nodes in the rendered answer container
+2. **Skip excluded elements:** Reject text nodes whose parent matches `code`, `pre`, `script`, `style`, `sup`, or `.kg-highlight`
+3. **Match terms:** For each text node, build regex patterns with word boundaries (`\b`) for each knowledge graph term. Sort terms by name length descending (longest first)
+4. **Resolve overlaps:** When multiple terms match overlapping ranges in the same text node, keep only the longer match. If lengths are equal, entity (priority 3) > concept (priority 2) > category (priority 1)
+5. **Replace text nodes:** Split the text node into fragments, wrapping matched ranges in `<span>` elements with the appropriate highlight class
+
+**Timing:** Highlighting is applied after the answer stream completes, with a 500ms debounce. A fallback `forceHighlight()` function runs 100ms after stream completion as a safety net.
+
+**Term filtering:** Terms shorter than 3 characters or longer than 50 characters are excluded. Terms that look like URLs are excluded.
+
+### Highlight Span Structure
+
+Each highlighted term produces:
+
+```html
+<span class="kg-highlight kg-{type} {color-classes}"
+      data-kg-term-encoded="{base64-encoded JSON term data}"
+      data-kg-type="{type}"
+      data-kg-name="{term name}"
+      role="button"
+      tabindex="0"
+      aria-label="{type}: {term name} ({count} related bookmarks)"
+      aria-expanded="false"
+      aria-haspopup="dialog">
+  {matched text}
+</span>
+```
+
+### Highlight Tooltip
+
+Clicking or activating (Enter/Space) a highlighted term opens a floating tooltip:
+
+| Element | Content |
+|---------|---------|
+| Header | Type icon + term name + type label |
+| Bookmark count | "N related bookmarks" |
+| Related bookmarks | Up to 3 bookmark links (title, clickable → detail modal) |
+| Expand link | "Show all N bookmarks" when count > 3 |
+| Explore button | Submits the term as a new question in the Ask view |
+
+**Tooltip dismissal:** Clicking outside, pressing Escape, or clicking another highlight closes the tooltip.
+
+**Accessibility:** The tooltip has `role="dialog"` and `aria-live="polite"`. The highlight span toggles `aria-expanded` on open/close.
+
+### Highlighting Invariants
+
+- Highlights are never applied inside `<code>`, `<pre>`, `<script>`, `<style>`, or `<sup>` elements (INV-013)
+- Running highlighting on already-highlighted content is idempotent — `.kg-highlight` elements are in the exclusion list (PROP-020)
+- The color mapping is consistent across all UI surfaces (INV-015)
+
+---
+
+## Content Display Formatting
+
+Content and summaries are displayed differently depending on the UI context. This section specifies how content is rendered in each view.
+
+### Markdown Auto-Detection
+
+When displaying content that may or may not be markdown (summaries, bookmark content), the system tests against 11 regex patterns:
+
+| Pattern | Matches |
+|---------|---------|
+| `/^#{1,6}\s/m` | Headers (`# Title`) |
+| `/\*\*[^*]+\*\*/` | Bold (`**text**`) |
+| `/\*[^*]+\*/` | Italic (`*text*`) |
+| `/\[.+\]\(.+\)/` | Links (`[text](url)`) |
+| `/^[\*\-]\s/m` | Unordered lists (`- item`) |
+| `/^\d+\.\s/m` | Ordered lists (`1. item`) |
+| `/^>\s/m` | Blockquotes (`> text`) |
+| `/```[\s\S]*```/` | Fenced code blocks |
+| `/`[^`]+`/` | Inline code |
+| `/^\|.+\|/m` | Tables (`| cell |`) |
+| `/^---+$/m` | Horizontal rules |
+
+If **any** pattern matches, the content is rendered via the markdown parser and wrapped in `<div class="markdown-content">`. Otherwise, the plain-text fallback rendering is used.
+
+### Rendering by View Context
+
+| Context | Source Field | Rendering | Truncation |
+|---------|-------------|-----------|------------|
+| Bookmark list card | `summary` (fallback: `snippet`) | Plain text via `x-text` | CSS 2-line clamp (`line-clamp-2`) |
+| Ask view answer | LLM markdown stream | Full markdown pipeline (Stage 1-4) | None |
+| Detail modal: summary | `summary` | Markdown auto-detect → `marked.parse()` or plain-text fallback | None |
+| Detail modal: content | `content` | Markdown auto-detect → `marked.parse()` or plain-text fallback | 1500 chars default, expandable |
+| Citation card | — | Structured HTML card | Title truncated, URL truncated to 100 chars |
+
+### Plain-Text Fallback Rendering
+
+When content does not match markdown patterns, the fallback renderer:
+
+1. Truncates to 1500 characters (for content preview) with `...` suffix
+2. Normalizes whitespace: `\r\n` → `\n`, collapse triple+ newlines, collapse spaces
+3. Converts `**text**` to `<strong class="font-semibold text-gray-900">text</strong>`
+4. Converts `Label:` patterns at start of lines to bold: `**Label:**`
+5. Splits on double newlines into `<p class="mb-4">` paragraphs
+6. Converts remaining single `\n` to `<br>`
+
+### Snippet Generation (Backend)
+
+Snippets are short plain-text previews generated server-side for use in bookmark list cards and search results.
+
+**Generation rules:**
+
+| Priority | Source | Behavior |
+|----------|--------|----------|
+| 1 | `content` field | First 200 characters + `...` if truncated |
+| 2 | `notes` field | First 200 characters + `...` if truncated (only if content is empty) |
+| 3 | Graph relationship | `"Related through: {categories}, {concepts}"` for graph-derived results |
+
+**Search-highlighted snippets:** The database generates highlighted snippets via `ts_headline` with `<mark>` / `</mark>` tags for search term highlighting:
+
+```
+ts_headline('english', content, query,
+  'StartSel=<mark>, StopSel=</mark>, MaxWords=35, MinWords=15, ShortWord=3, HighlightAll=FALSE')
+```
+
+These `<mark>`-wrapped snippets are available in `SearchResult.Snippet` for search-context displays. The `<mark>` tag renders with the browser's default highlight (yellow background) in contexts where HTML is rendered.
+
+---
+
 ## Content Chunking
 
 ### Configuration
@@ -884,52 +1142,62 @@ The AI prompt strategy and output budget vary by content type:
 
 | Content Type | Prompt Strategy | Max Output Tokens | Temperature |
 |---|---|---|---|
-| `youtube` | Timestamped structured outline (see format below) | 4000-8000 | 0.5 |
+| `youtube` | Title + intro paragraph + timestamped standalone-summary outline (see format below) | 4000 (OpenAI) / 8000 (Gemini) | 0.5 |
 | `twitter` / `tiktok` | Main message, key facts, context, and tone in 2-3 paragraphs | 1000 | 0.5 |
-| `article` / `webpage` | 5-section numbered structure (see format below) | 2000-8000 | 0.5 |
-| default | Generic: main topic, key points, technical info, conclusions | 2000-8000 | 0.5 |
+| `article` / `webpage` | 5-section numbered structure (see format below) | 2000 (OpenAI) / 8000 (Gemini) | 0.5 |
+| default | Generic: main topic, key points, technical info, conclusions | 2000 (OpenAI) / 8000 (Gemini) | 0.5 |
+
+**Token budget note:** Higher token budgets produce significantly richer summaries, especially for YouTube (which benefits from detailed per-section descriptions). The Gemini provider's 8000-token budget is preferred for YouTube content, as it allows each section to include full paragraph descriptions rather than just bullet points.
 
 #### YouTube Summary Format
 
-YouTube summaries must produce a **navigable index** of the video transcript with the following structure:
+YouTube summaries must produce a **navigable index** that also serves as a **standalone summary** — each section should be rich enough for a reader to understand the content without watching the video. The summary is generated in the same language as the video content (e.g., Spanish content produces a Spanish summary).
 
-1. **Title**: A descriptive title capturing the main theme of the video
-2. **Timestamped sections** organized by major topic transitions:
-   - Timestamps in `MM:SS` format (aim for 5-10 minute segments)
-   - Clear section headers at each topic transition
-   - Under each timestamp: the main topic/question discussed, key assertions, specific examples or references mentioned
-   - Speaker attributions for important statements (e.g., "Ross asserts...")
-   - Bullet points for sub-topics within sections
-   - Brief "Related reading" notes where relevant topics are mentioned
+1. **Title**: A descriptive, original title that captures the main theme and value proposition of the video. This is NOT the YouTube video title — it is a newly created title that summarizes the core thesis.
+2. **Introductory paragraph**: A 2-4 sentence high-level summary providing context (who the speakers are, what's discussed, why it matters). This paragraph helps someone decide whether to read the full index.
+3. **Section header**: A label like "Structured Index" or "Episode Index" (in the content's language) that introduces the timestamped outline.
+4. **Timestamped sections** organized by major topic transitions:
+   - Timestamps in `MM:SS` format for videos under 1 hour, `HH:MM:SS` format for videos 1 hour or longer
+   - Aim for 5-15 minute segments between timestamps
+   - Descriptive section titles (not bracketed labels) that capture the topic or question being discussed
+   - Under each timestamp: 2-5 sentences describing what's discussed, including specific details, examples, numbers, names, and quotes from the transcript
+   - Speaker attributions for important statements (e.g., "Arnau explains...")
+   - Bullet points for specific sub-topics, tools, or references mentioned
+   - Brief context or "Related reading" notes where relevant topics are mentioned
 
 **Expected output structure:**
 ```
-[Descriptive Title]
+[Descriptive Original Title]
 
-00:00 [Section Title]
-[Brief context or related reading]
+[2-4 sentence introductory paragraph with context about speakers, topic, and why it matters]
 
-[Key question discussed or main assertion]
+[Section Header — e.g., "Structured Episode Index"]
+03:05 - [Descriptive Section Title]
 
-• Point 1
-• Point 2
-• Specific example or reference mentioned
+[2-5 sentences describing what's discussed in this section, including specific details from the transcript such as names, numbers, examples, and key assertions]
 
-08:30 [Next Section Title]
-[Main topic/question for this section]
+07:12 - [Descriptive Section Title]
 
-[Speaker] asserts...
-• Point 1
-• Point 2
+[Full paragraph description of this section's content. Includes specific points raised, questions answered, and any references mentioned.]
+[Speaker] explains...
+• Specific sub-point or tool mentioned
+• Another specific detail from the transcript
+
+15:30 - [Descriptive Section Title]
+
+[Rich description continues...]
 
 ...
 ```
 
 **YouTube format invariants:**
-- MUST contain at least one timestamp in `MM:SS` format
-- MUST start directly with the title (no preamble)
-- Each timestamp section MUST have a section header in brackets
+- MUST contain at least one timestamp in `MM:SS` or `HH:MM:SS` format
+- MUST start directly with the title (no preamble like "Here is a summary...")
+- MUST include an introductory summary paragraph after the title
+- Each timestamp section MUST have a descriptive section title
 - Timestamps MUST appear in chronological order
+- MUST be in the same language as the video content
+- Each section MUST be detailed enough to be a standalone summary of that segment (not just bullet points or one-liners)
 
 #### Article / Webpage Summary Format
 
@@ -979,6 +1247,7 @@ For content that doesn't match a specific type, summaries must:
 - If summary generation fails, the error is logged and the bookmark is created with a null/empty summary
 - On re-extraction, if summary generation fails, the existing summary is preserved (null-coalescing update)
 - Summary output MUST begin directly with content — never with introductory phrases like "Here is a summary...", "Of course, here is...", "Sure! Here's...", or similar preamble. This is enforced via prompt instructions.
+- Summary language MUST match the content language (PROP-023). Spanish content produces a Spanish summary, English content produces an English summary. This is not explicitly instructed in the prompt — the LLM naturally mirrors the input language — but it is an invariant that must hold.
 
 ### Path 2: Summarize-Then-Embed (Transient)
 
@@ -1037,26 +1306,31 @@ When content exceeds the embedding provider's maximum input length, it is summar
 
 ---
 
-## Google AI Integration
+## Embedding Providers
 
-### Embedding
+### Provider Abstraction
 
-All embeddings use Google Gemini (`gemini-embedding-001`):
-- **Dimensions**: 3072
-- **Max input length**: 80,000 characters
-- **Task types**: Supports task-type hints (e.g., document vs. query embeddings)
+The system supports multiple embedding providers via a provider abstraction. Each provider must implement:
+- `GenerateEmbedding(text, taskType?) → vector` — generate an embedding vector for content
+- `GenerateChatCompletion(prompt, options?) → text` — generate text via a chat/completion model
+
+Provider configuration specifies:
+- **Dimensions**: The fixed vector length for the provider (must be consistent across all bookmarks)
+- **Max input length**: Character limit before content must be summarized or truncated
+- **Task types**: Whether the provider supports task-type hints (e.g., document vs. query embeddings)
 
 ### Long Content Handling
 
-- Content exceeding 80,000 characters is summarized first, then the summary is embedded
+- Content exceeding the provider's max input is summarized first, then the summary is embedded
 - If summarization input is very large, it is truncated using a head+tail strategy (first half + last half of the allowed range)
 - If summarization fails, intelligent truncation finds the last sentence boundary within the allowed range
 
 ### Chat Model Routing
 
 Dynamic model selection based on request characteristics:
-- Large or complex tasks (JSON extraction, long inputs): route to `gemini-2.5-pro`
-- Small tasks: route to `gemini-2.5-flash`
+- Large or complex tasks (JSON extraction, long inputs): route to a more capable model
+- Small tasks: route to a faster/cheaper model
+- On server error with the primary model: fallback to the secondary model
 - On structured output failure: retry without structured output constraints
 
 ---
@@ -1128,27 +1402,21 @@ The application has three primary views, switched via a sticky header navigation
 - Questions saved to `localStorage` history (max 10 items)
 - "Quick ask" input also available in the Bookmarks view header, which transfers the question to Ask view
 
-**Answer streaming:**
+**Answer streaming and rendering:**
 - Opens SSE connection to `GET /answer?q=...`
-- Text chunks appended in real-time, rendered as Markdown (GFM enabled)
-- `[N]` citation references are post-processed into clickable superscript links that smooth-scroll to the corresponding citation card with a temporary blue ring highlight (2 seconds)
+- Text chunks appended in real-time, processed through the full [Answer Rendering Pipeline](#answer-rendering-pipeline): markdown rendering → citation transformation → KG highlighting → CSS styling
 - Pulse skeleton shown while waiting for first chunk
+- See [Answer Rendering Pipeline](#answer-rendering-pipeline) for complete rendering specification
 
 **Knowledge graph highlighting:**
-- After streaming completes, the answer text is scanned for known knowledge graph terms (categories, concepts, entities)
-- Matching terms are wrapped in colored spans: blue (category), green (concept), orange (entity)
-- Highlighted terms are clickable, opening a floating tooltip with:
-  - Term name and type
-  - Count of related bookmarks
-  - Up to 3 related bookmark links (expandable to show all)
-  - "Explore" button that submits the term as a new question
-- Tooltip has keyboard support (Enter/Space to activate, Escape to close) and ARIA attributes (`role="dialog"`, `aria-live="polite"`)
+- Applied after streaming completes via the DOM-based highlighting algorithm
+- See [Knowledge Graph Term Highlighting](#knowledge-graph-term-highlighting) for complete specification including color system, overlap resolution, tooltip behavior, and accessibility
 
 **Citation display:**
-- "Sources" section appears below the answer
-- Each citation card shows: citation number (blue circle), thumbnail, title (clickable, opens detail modal), URL (external link), category/concept/entity pills (clickable, trigger related bookmark search), YouTube indicator (channel + duration), creation date
+- "Sources" section appears below the answer with citation cards
+- See [Answer Rendering Pipeline: Stage 2](#stage-2-citation-transformation) for citation card structure and interaction behavior
 - Citations are lazy-loaded via IntersectionObserver with 100px rootMargin
-- Only citations actually referenced as `[N]` in the answer text are shown
+- Only citations actually referenced as `[N]` in the answer text are shown (INV-014)
 
 **Question history:**
 - Previous questions shown below citations
@@ -1174,8 +1442,8 @@ Overlay modal (max-w-4xl, max-h-90vh) opened by clicking any bookmark title. Con
 3. **Preview image** (conditional)
 4. **Knowledge graph metadata:** Clickable pills for categories (blue), concepts (green), topics (purple), entities (orange with type label). Clicking a pill loads related bookmarks inline
 5. **Related bookmarks** (conditional, shown after clicking a graph pill): List of related bookmarks with clickable titles and tag pills
-6. **Summary section**
-7. **Content preview:** Truncated to 1500 chars with "Show Full Content" / "Show Less" toggle
+6. **Summary section:** Rendered via markdown auto-detection (see [Content Display Formatting](#content-display-formatting))
+7. **Content preview:** Rendered via markdown auto-detection, truncated to 1500 chars with "Show Full Content" / "Show Less" toggle (see [Content Display Formatting](#content-display-formatting))
 8. **Personal notes:** View/edit/add mode with textarea and save/cancel buttons. Saving triggers `PUT /bookmark/{id}/notes` and async graph re-indexing
 
 **Delete flow:** Delete button opens a confirmation modal with warning icon, bookmark title, and Cancel/Delete buttons. Delete calls `DELETE /bookmark/{id}` and removes the bookmark from the list.
@@ -1298,11 +1566,11 @@ Settings stored in browser extension sync storage (syncs across browser instance
 
 ### Tier 1: Durable Evaluations (survive reimplementation)
 
-- **Invariant checks**: Verify INV-001 through INV-012 hold after operations
-- **Property-based tests**: Verify PROP-001 through PROP-012 with generated inputs
+- **Invariant checks**: Verify INV-001 through INV-015 hold after operations
+- **Property-based tests**: Verify PROP-001 through PROP-023 with generated inputs
 - **Contract conformance**: Verify all interface schemas (request/response shapes, status codes)
 - **End-to-end behavioral checks**: URL -> bookmark -> searchable -> deletable lifecycle
-- **Boundary tests**: Chunking thresholds, embedding dimension limits, pagination bounds
+- **Boundary tests**: Chunking thresholds, embedding dimension limits, pagination bounds, rendering pipeline stages
 
 ### Tier 2: Ephemeral Tests (disposable with implementation)
 
@@ -1399,13 +1667,18 @@ Before considering the implementation complete:
 - [ ] Errors are returned as JSON with appropriate HTTP status codes
 - [ ] CORS headers are set on all responses
 - [ ] Health check endpoint returns 200
+- [ ] Answer rendering pipeline produces correct HTML from markdown stream
+- [ ] Citation `[N]` references are transformed into clickable superscript links
+- [ ] Knowledge graph term highlighting respects excluded elements (code, pre, sup)
+- [ ] Highlight color system is consistent across all UI surfaces
+- [ ] Content display uses markdown auto-detection with correct fallback rendering
 
 ---
 
 ## Regeneration Confidence Checklist
 
-- [x] All system invariants are explicit (INV-001 through INV-012)
-- [x] All behavioral properties are formally stated (PROP-001 through PROP-016)
+- [x] All system invariants are explicit (INV-001 through INV-015)
+- [x] All behavioral properties are formally stated (PROP-001 through PROP-023)
 - [x] All interface contracts have precise schemas (14 endpoints documented)
 - [x] All functions have unambiguous behavior tables
 - [x] All boundary conditions have exact threshold values
@@ -1413,6 +1686,9 @@ Before considering the implementation complete:
 - [x] Property-based tests cover function composition behaviors
 - [x] Live evaluation criteria would catch drift after regeneration
 - [x] No critical behavior exists only as implicit knowledge
+- [x] Answer rendering pipeline fully specified (markdown → citations → KG highlights → CSS)
+- [x] Knowledge graph highlighting algorithm, color system, and tooltip behavior documented
+- [x] Content display formatting rules documented for all view contexts
 
 ---
 
@@ -1428,7 +1704,8 @@ This section documents the technology choices made in the initial implementation
 | Relational database | PostgreSQL | With pgvector extension for vector indexes |
 | Full-text search | PostgreSQL tsvector | `GENERATED ALWAYS` columns, `ts_rank_cd` for ranking |
 | Knowledge graph | Neo4j | Cypher queries, MERGE for idempotent node creation |
-| Embedding provider | Google Gemini `gemini-embedding-001` | 3072 dimensions, task-type support |
+| Embedding provider (primary) | Google Gemini `gemini-embedding-001` | 3072 dimensions, task-type support |
+| Embedding provider (secondary) | OpenAI `text-embedding-3-small` | 1536 dimensions |
 | Chat model (large) | Gemini `gemini-2.5-pro` | Used for complex extraction and long content |
 | Chat model (small) | Gemini `gemini-2.5-flash` | Used for summaries and small tasks |
 | Archive/paywall fallback | Tavily API | Retrieves archived versions of paywalled content |
@@ -1466,7 +1743,8 @@ This section documents the technology choices made in the initial implementation
 
 ## Version History
 
-- **v0.6.0** - Removed dual embedding provider abstraction and OpenAI secondary provider. All embeddings and chat completions now use Google Gemini exclusively with concrete model references and fixed 3072 dimensions.
+- **v0.6.1** - Updated YouTube Summary Format to match actual codebase output: added introductory summary paragraph, adaptive timestamp format (MM:SS / HH:MM:SS), rich per-section descriptions instead of sparse bullets, removed bracket requirement for section headers, added language-matching requirement. Added PROP-023 for summary language matching. Clarified provider-specific token budgets (OpenAI 4000 vs Gemini 8000). Updated tests.yaml to reflect richer YouTube summary format.
+- **v0.6.0** - Added Answer Rendering Pipeline section (markdown rendering, citation transformation with scroll-to-card + ring animation, rendering stages). Added Knowledge Graph Term Highlighting section (TreeWalker algorithm, color system, overlap resolution, tooltip behavior, accessibility). Added Content Display Formatting section (markdown auto-detection patterns, rendering by view context, plain-text fallback, snippet generation). Added INV-013 through INV-015 for highlighting and citation invariants. Added PROP-017 through PROP-022 for rendering pipeline properties. Added tests for extractCitedNumbers, formatAnswer, KG highlighting, markdown detection, and content rendering.
 - **v0.5.0** - Added precise summary output format templates (YouTube timestamped index, article 5-section structure, social media 2-3 paragraph), added Answer Generation section with intent-specific system prompts, context template format, result filtering rules, and search strategy parameters. Added PROP-013 through PROP-016 for summary format and prompt behavior. Added SummaryGeneration and AnswerGeneration test sections.
 - **v0.4.0** - Clarified single-user auth model, documented search path switching (language detection), standardized Job Status to snake_case, added metadata schema per content type, documented snippet generation, clarified content cleaning scope (archive-only), documented re-extract full regeneration scope, documented content-type-specific summary prompts, clarified total sentinel -2 threshold, documented nodes[] graph filtering mechanism, documented related bookmarks score field, marked Analysis Mode as not yet specced
 - **v0.3.2** - Added Summary Generation section with content-type-aware strategies and summarize-then-embed path

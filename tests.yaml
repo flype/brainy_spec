@@ -1,7 +1,7 @@
-version: "0.6.0"
+version: "0.6.1"
 
 # Reference values:
-# - Embedding dimensions: 3072 (Google Gemini)
+# - Embedding dimensions: 3072 (Gemini), 1536 (OpenAI)
 # - Chunking threshold: 24000 chars
 # - Max chunk size: 4000 chars
 # - Chunk overlap: 400 chars
@@ -9,6 +9,11 @@ version: "0.6.0"
 # - RRF constant k: 50 (default)
 # - Default semantic weight: 0.6, lexical weight: 0.4
 # - Job queue: 5 workers, 100 buffer, 3 max retries
+# - KG highlight colors: blue=category, green=concept, orange=entity
+# - Markdown detection: 11 regex patterns
+# - Citation ring highlight duration: 2 seconds
+# - KG term cache TTL: 5 minutes
+# - Snippet max length: 200 chars
 
 # =============================================================================
 # SYSTEM INVARIANTS -- Properties that must hold after any state mutation
@@ -65,6 +70,18 @@ invariants:
   - name: "invariant - orphaned graph nodes are cleaned up"
     after: [DeleteBookmarkFromGraph]
     property: "No Category/Concept/Entity nodes exist with zero relationships"
+
+  - name: "invariant - KG highlights never inside excluded elements"
+    after: [highlightTextNodes, forceHighlight]
+    property: "No <span class='kg-highlight'> exists as a descendant of code, pre, script, style, or sup elements"
+
+  - name: "invariant - only cited sources sent as citation events"
+    after: [AnswerQuestion]
+    property: "Every citation event number N has a corresponding [N] match in the accumulated answer text"
+
+  - name: "invariant - KG type color mapping is consistent"
+    after: [highlightTextNodes, renderCitationCard, renderDetailModal, renderAutocomplete]
+    property: "category always uses blue-100/blue-700, concept always uses green-100/green-700, entity always uses orange-100/orange-700"
 
 # =============================================================================
 # BEHAVIORAL PROPERTIES -- Universal truths for generative testing
@@ -138,7 +155,12 @@ properties:
   - name: "property - summary format determined by content type"
     functions: [GenerateContentSummary]
     for_all: { content: "non-empty string", content_type: "valid content type" }
-    property: "content_type == 'youtube' => summary contains MM:SS timestamps AND content_type in ('webpage', 'article') => summary starts with '1. **Main Topic**' AND content_type in ('twitter', 'tiktok') => paragraph_count(summary) <= 3"
+    property: "content_type == 'youtube' => summary has title + intro paragraph + timestamps in MM:SS or HH:MM:SS format AND content_type in ('webpage', 'article') => summary starts with '1. **Main Topic**' AND content_type in ('twitter', 'tiktok') => paragraph_count(summary) <= 3"
+
+  - name: "property - summary language matches content language"
+    functions: [GenerateContentSummary]
+    for_all: { content: "non-empty string in any language", content_type: "valid content type" }
+    property: "detected_language(summary) == detected_language(content)"
 
   - name: "property - summary never starts with preamble"
     functions: [GenerateContentSummary]
@@ -154,6 +176,36 @@ properties:
     functions: [buildContextTemplate]
     for_all: { results: "array of N search results", query: "non-empty string" }
     property: "for i in 1..N: contains(context, 'Source [' + i + ']') AND ends_with(context, 'User Question: ' + query)"
+
+  - name: "property - extractCitedNumbers returns unique numbers in order of first appearance"
+    functions: [extractCitedNumbers]
+    for_all: { text: "any string containing [N] patterns" }
+    property: "all returned numbers appear as [N] in text AND no duplicates AND order matches first occurrence"
+
+  - name: "property - formatAnswer transforms all [N] into sup links"
+    functions: [formatAnswer]
+    for_all: { answer: "any markdown string containing [N] patterns" }
+    property: "output contains no raw [N] patterns AND count(<sup>) == count([N] in input)"
+
+  - name: "property - KG highlights never overlap"
+    functions: [highlightTextNodes]
+    for_all: { element: "DOM element with text", terms: "array of KG terms" }
+    property: "for all highlight spans s1, s2: s1.textRange intersect s2.textRange == empty"
+
+  - name: "property - KG highlighting is idempotent"
+    functions: [highlightTextNodes]
+    for_all: { element: "DOM element with text", terms: "array of KG terms" }
+    property: "highlightTextNodes(highlightTextNodes(element, terms), terms) produces no new spans"
+
+  - name: "property - markdown detection determines rendering path"
+    functions: [renderContentPreview]
+    for_all: { content: "any non-empty string" }
+    property: "isMarkdown(content) => output contains '<div class=\"markdown-content\">' AND !isMarkdown(content) => output contains '<p class=\"mb-4\">'"
+
+  - name: "property - snippet length bounded"
+    functions: [getSnippet]
+    for_all: { content: "any string", notes: "any string" }
+    property: "len(snippet) <= 203 AND (content != '' => snippet derived from content)"
 
 # =============================================================================
 # INTERFACE CONTRACTS -- HTTP endpoint schema conformance
@@ -904,15 +956,26 @@ JobQueue:
 # -- Embedding Provider -------------------------------------------------------
 EmbeddingProvider:
   # DURABLE -- Dimension validation
+  - name: "boundary - OpenAI returns 1536 dimensions"
+    durability: durable
+    input: { provider: "openai", text: "Hello world" }
+    output: { dimensions: 1536 }
+
   - name: "boundary - Gemini returns 3072 dimensions"
     durability: durable
-    input: { text: "Hello world" }
+    input: { provider: "gemini", text: "Hello world" }
     output: { dimensions: 3072 }
 
   # DURABLE -- Long content handling
+  - name: "boundary - OpenAI truncates at 24000 chars"
+    durability: durable
+    input: { provider: "openai", text: "x repeated 30000 times" }
+    output: { embedding_generated: true, dimensions: 1536 }
+    note: "Content is summarized before embedding, not truncated at embed time"
+
   - name: "boundary - Gemini truncates at 80000 chars"
     durability: durable
-    input: { text: "x repeated 100000 times" }
+    input: { provider: "gemini", text: "x repeated 100000 times" }
     output: { embedding_generated: true, dimensions: 3072 }
 
 # -- SSE Answer Stream --------------------------------------------------------
@@ -941,25 +1004,46 @@ AnswerQuestion:
 # -- Summary Generation -------------------------------------------------------
 SummaryGeneration:
   # DURABLE -- YouTube summary format
-  - name: "boundary - YouTube summary contains timestamps in MM:SS format"
+  - name: "boundary - YouTube summary contains timestamps in MM:SS or HH:MM:SS format"
     durability: durable
     input: { content_type: "youtube", content: "video transcript with multiple topics" }
-    output: { contains_timestamp_pattern: "\\d{1,2}:\\d{2}", timestamp_count_gte: 1 }
+    output: { contains_timestamp_pattern: "(\\d{1,2}:\\d{2}:\\d{2}|\\d{1,2}:\\d{2})", timestamp_count_gte: 1 }
 
   - name: "boundary - YouTube summary starts with title (no preamble)"
     durability: durable
     input: { content_type: "youtube", content: "video transcript" }
     output: { does_not_start_with: ["Here is", "Of course", "Sure", "I've created", "Below is"] }
 
-  - name: "boundary - YouTube summary has section headers in brackets"
+  - name: "boundary - YouTube summary has descriptive section titles after timestamps"
     durability: durable
     input: { content_type: "youtube", content: "video transcript with topic changes" }
-    output: { contains_pattern: "\\d{1,2}:\\d{2}\\s+\\[.+\\]" }
+    output: { contains_pattern: "(\\d{1,2}:\\d{2}:\\d{2}|\\d{1,2}:\\d{2})\\s*[-–]?\\s*.{10,}" }
 
   - name: "boundary - YouTube summary timestamps are chronologically ordered"
     durability: durable
     input: { content_type: "youtube", content: "long video transcript" }
     output: { timestamps_chronologically_ordered: true }
+
+  - name: "boundary - YouTube summary includes introductory paragraph after title"
+    durability: durable
+    input: { content_type: "youtube", content: "video transcript about a specific topic" }
+    output: { has_intro_paragraph_before_first_timestamp: true, intro_paragraph_min_length: 50 }
+
+  - name: "boundary - YouTube summary sections have rich descriptions (not just bullets)"
+    durability: durable
+    input: { content_type: "youtube", content: "detailed video transcript" }
+    output: { avg_section_description_length_gte: 50 }
+    note: "Each section should have at least 2-5 sentences of description, not just one-line bullet points"
+
+  - name: "boundary - YouTube summary language matches content language"
+    durability: durable
+    input: { content_type: "youtube", content: "transcripción de video en español sobre tecnología" }
+    output: { summary_language: "es" }
+
+  - name: "boundary - long YouTube video uses HH:MM:SS timestamps"
+    durability: durable
+    input: { content_type: "youtube", content: "transcript of 1h30m video", video_duration_seconds: 5400 }
+    output: { contains_timestamp_pattern: "\\d{1,2}:\\d{2}:\\d{2}" }
 
   # DURABLE -- Article summary format
   - name: "boundary - article summary has 5 numbered sections"
@@ -1015,27 +1099,44 @@ SummaryGeneration:
     input: { url: "https://example.com/article", content: "article text" }
     output: { summary_format: "article_5_section" }
 
-  # DURABLE -- Token limits per content type
-  - name: "boundary - YouTube summary max tokens is 4000-8000"
+  # DURABLE -- Token limits per content type and provider
+  - name: "boundary - YouTube summary max tokens is 4000 (OpenAI) or 8000 (Gemini)"
     durability: durable
     input: { content_type: "youtube" }
-    output: { max_tokens_gte: 4000, max_tokens_lte: 8000 }
+    output: { max_tokens_openai: 4000, max_tokens_gemini: 8000 }
 
   - name: "boundary - social media summary max tokens is 1000"
     durability: durable
     input: { content_type: "twitter" }
     output: { max_tokens: 1000 }
 
-  - name: "boundary - article summary max tokens is 2000-8000"
+  - name: "boundary - article summary max tokens is 2000 (OpenAI) or 8000 (Gemini)"
     durability: durable
     input: { content_type: "webpage" }
-    output: { max_tokens_gte: 2000, max_tokens_lte: 8000 }
+    output: { max_tokens_openai: 2000, max_tokens_gemini: 8000 }
 
   # EPHEMERAL -- Format examples
   - name: "example - YouTube summary includes speaker attributions"
     durability: ephemeral
     input: { content_type: "youtube", content: "transcript with multiple speakers" }
     output: { contains_speaker_attribution: true }
+
+  - name: "example - YouTube summary has specific details from transcript (no hallucination)"
+    durability: ephemeral
+    input: { content_type: "youtube", content: "transcript mentioning specific names, numbers, and examples" }
+    output: { summary_contains_specific_details_from_input: true }
+    note: "Summary MUST reference actual entities from the transcript, not generic/hallucinated content"
+
+  - name: "example - YouTube summary sections are standalone summaries"
+    durability: ephemeral
+    input: { content_type: "youtube", content: "90-minute podcast transcript" }
+    output: { each_section_has_paragraph_description: true, each_section_min_sentences: 2 }
+    note: "Each timestamped section should have enough detail for someone to understand the topic without watching"
+
+  - name: "example - Spanish YouTube video produces Spanish summary"
+    durability: ephemeral
+    input: { content_type: "youtube", content: "transcripción de un podcast sobre startups SaaS en restauración" }
+    output: { summary_language: "es", contains_intro_paragraph: true, timestamps_present: true }
 
   - name: "example - article summary preserves technical details"
     durability: ephemeral
@@ -1251,6 +1352,502 @@ convertHTMLToMarkdown:
     input: { html: "<ul><li>Item 1<ul><li>Sub item</li></ul></li></ul>" }
     output: { markdown_contains: "  - Sub item" }
 
+# -- Citation Number Extraction -----------------------------------------------
+extractCitedNumbers:
+  # DURABLE -- Core extraction behavior
+  - name: "boundary - extracts single citation"
+    durability: durable
+    input: { text: "This is relevant [1] to our discussion" }
+    output: [1]
+
+  - name: "boundary - extracts multiple citations in order"
+    durability: durable
+    input: { text: "According to [2] and [1], the approach in [3] is best" }
+    output: [2, 1, 3]
+
+  - name: "boundary - deduplicates repeated citations"
+    durability: durable
+    input: { text: "As noted in [1], and confirmed by [2], again [1] agrees" }
+    output: [1, 2]
+
+  - name: "boundary - no citations returns empty array"
+    durability: durable
+    input: { text: "This text has no citations at all" }
+    output: []
+
+  - name: "boundary - empty text returns empty array"
+    durability: durable
+    input: { text: "" }
+    output: []
+
+  # DURABLE -- Edge cases
+  - name: "boundary - does not extract non-numeric brackets"
+    durability: durable
+    input: { text: "Using [array] notation and [N] placeholder" }
+    output: []
+
+  - name: "boundary - extracts multi-digit citation numbers"
+    durability: durable
+    input: { text: "Sources [12] and [3] confirm this" }
+    output: [12, 3]
+
+  # EPHEMERAL -- Complex text
+  - name: "example - citations in markdown with other brackets"
+    durability: ephemeral
+    input: { text: "The code `arr[0]` shows [1] and the map `m[key]` relates to [2]" }
+    output: [1, 2]
+    note: "arr[0] contains a digit but is part of code context - regex still matches [0] as a citation"
+
+# -- Answer Formatting (Citation Transformation) ------------------------------
+formatAnswer:
+  # DURABLE -- Markdown rendering
+  - name: "boundary - renders markdown headers to HTML"
+    durability: durable
+    input: { answer: "# Title\n\nSome text" }
+    output: { html_contains: "<h1>", html_contains_2: "Title" }
+
+  - name: "boundary - renders markdown bold to HTML"
+    durability: durable
+    input: { answer: "This is **bold** text" }
+    output: { html_contains: "<strong>bold</strong>" }
+
+  - name: "boundary - renders markdown code blocks"
+    durability: durable
+    input: { answer: "```javascript\nconst x = 1;\n```" }
+    output: { html_contains: "<pre>", html_contains_code: "<code" }
+
+  - name: "boundary - renders markdown tables"
+    durability: durable
+    input: { answer: "| Col1 | Col2 |\n|------|------|\n| A | B |" }
+    output: { html_contains: "<table>", html_contains_td: "<td>" }
+
+  # DURABLE -- Citation transformation
+  - name: "boundary - transforms [1] into clickable superscript"
+    durability: durable
+    input: { answer: "This is important [1]." }
+    output: { html_contains_sup: true, html_contains_citation_link: "#citation-1", no_raw_bracket_1: true }
+
+  - name: "boundary - transforms multiple citations"
+    durability: durable
+    input: { answer: "See [1] and [2] for details." }
+    output: { sup_count: 2, citation_link_targets: ["#citation-1", "#citation-2"] }
+
+  - name: "boundary - citation click triggers scroll and ring"
+    durability: durable
+    input: { answer: "Reference [1]" }
+    output: { onclick_contains_scrollIntoView: true, onclick_contains_ring_2: true, onclick_contains_setTimeout_2000: true }
+
+  - name: "boundary - wraps output in div"
+    durability: durable
+    input: { answer: "Simple text" }
+    output: { starts_with: "<div>", ends_with: "</div>" }
+
+  # DURABLE -- Error handling
+  - name: "boundary - empty answer returns empty string"
+    durability: durable
+    input: { answer: "" }
+    output: ""
+
+  - name: "boundary - null answer returns empty string"
+    durability: durable
+    input: { answer: null }
+    output: ""
+
+  - name: "boundary - malformed markdown falls back to escaped text"
+    durability: durable
+    input: { answer: "<script>alert('xss')</script>" }
+    output: { does_not_contain_script_tag: true }
+    note: "marked.js with sanitize:false will pass through HTML, but the fallback path escapes HTML"
+
+  # EPHEMERAL -- Complex formatting
+  - name: "example - markdown with GFM features"
+    durability: ephemeral
+    input: { answer: "- [x] Task done\n- [ ] Task pending\n\n~~strikethrough~~" }
+    output: { html_contains_checkbox: true }
+
+  - name: "example - line breaks with breaks:true"
+    durability: ephemeral
+    input: { answer: "Line 1\nLine 2" }
+    output: { html_contains: "<br>" }
+
+# -- Knowledge Graph Highlighting ---------------------------------------------
+highlightTextNodes:
+  # DURABLE -- Element exclusion
+  - name: "boundary - does not highlight inside code elements"
+    durability: durable
+    input: { html: "<p>React is great</p><code>React.render()</code>", terms: [{ name: "React", type: "entity" }] }
+    output: { highlight_count: 1, highlight_in_p: true, no_highlight_in_code: true }
+
+  - name: "boundary - does not highlight inside pre elements"
+    durability: durable
+    input: { html: "<p>React hooks</p><pre>import React from 'react'</pre>", terms: [{ name: "React", type: "entity" }] }
+    output: { highlight_count: 1, no_highlight_in_pre: true }
+
+  - name: "boundary - does not highlight inside sup elements (citations)"
+    durability: durable
+    input: { html: "<p>React [1]</p><sup><a>[1]</a></sup>", terms: [{ name: "React", type: "entity" }] }
+    output: { highlight_in_p: true, no_highlight_in_sup: true }
+
+  - name: "boundary - does not highlight inside script or style"
+    durability: durable
+    input: { html: "<p>React</p><script>var React = require('react')</script><style>.React{}</style>", terms: [{ name: "React", type: "entity" }] }
+    output: { highlight_count: 1 }
+
+  - name: "boundary - does not highlight already-highlighted spans"
+    durability: durable
+    input: { html: "<p><span class='kg-highlight'>React</span> and React</p>", terms: [{ name: "React", type: "entity" }] }
+    output: { total_highlight_spans: 2, new_highlights_added: 1 }
+    note: "Idempotency: re-running highlighting on already-highlighted content does not double-wrap"
+
+  # DURABLE -- Overlap resolution
+  - name: "boundary - longer match wins over shorter overlap"
+    durability: durable
+    input: { html: "<p>Machine Learning is fascinating</p>", terms: [{ name: "Machine Learning", type: "concept" }, { name: "Machine", type: "entity" }] }
+    output: { highlight_count: 1, highlighted_text: "Machine Learning", highlight_type: "concept" }
+
+  - name: "boundary - entity priority wins over concept at same length"
+    durability: durable
+    input: { html: "<p>React patterns</p>", terms: [{ name: "React", type: "entity" }, { name: "React", type: "concept" }] }
+    output: { highlight_count: 1, highlight_type: "entity" }
+    note: "Entity priority (3) > Concept priority (2) > Category priority (1)"
+
+  - name: "boundary - non-overlapping terms both highlighted"
+    durability: durable
+    input: { html: "<p>React and Kubernetes are popular</p>", terms: [{ name: "React", type: "entity" }, { name: "Kubernetes", type: "entity" }] }
+    output: { highlight_count: 2 }
+
+  # DURABLE -- Color mapping
+  - name: "boundary - category terms get blue highlighting"
+    durability: durable
+    input: { html: "<p>Technology is a broad category</p>", terms: [{ name: "Technology", type: "category" }] }
+    output: { highlight_class_contains: "kg-category", highlight_class_contains_2: "bg-blue-100", highlight_class_contains_3: "text-blue-700" }
+
+  - name: "boundary - concept terms get green highlighting"
+    durability: durable
+    input: { html: "<p>Microservices architecture</p>", terms: [{ name: "Microservices", type: "concept" }] }
+    output: { highlight_class_contains: "kg-concept", highlight_class_contains_2: "bg-green-100", highlight_class_contains_3: "text-green-700" }
+
+  - name: "boundary - entity terms get orange highlighting"
+    durability: durable
+    input: { html: "<p>Kubernetes deployment</p>", terms: [{ name: "Kubernetes", type: "entity" }] }
+    output: { highlight_class_contains: "kg-entity", highlight_class_contains_2: "bg-orange-100", highlight_class_contains_3: "text-orange-700" }
+
+  # DURABLE -- Accessibility
+  - name: "boundary - highlight spans have role=button"
+    durability: durable
+    input: { html: "<p>React</p>", terms: [{ name: "React", type: "entity" }] }
+    output: { span_has_role_button: true, span_has_tabindex_0: true }
+
+  - name: "boundary - highlight spans have aria-label with type and count"
+    durability: durable
+    input: { html: "<p>React</p>", terms: [{ name: "React", type: "entity", count: 5 }] }
+    output: { aria_label_contains: "entity", aria_label_contains_2: "React" }
+
+  - name: "boundary - highlight spans have aria-expanded=false initially"
+    durability: durable
+    input: { html: "<p>React</p>", terms: [{ name: "React", type: "entity" }] }
+    output: { aria_expanded: "false" }
+
+  # DURABLE -- Term filtering
+  - name: "boundary - terms shorter than 3 chars are excluded"
+    durability: durable
+    input: { html: "<p>AI and ML are popular</p>", terms: [{ name: "AI", type: "concept" }, { name: "ML", type: "concept" }] }
+    output: { highlight_count: 0 }
+
+  - name: "boundary - terms longer than 50 chars are excluded"
+    durability: durable
+    input: { html: "<p>Very long term that exceeds the maximum character limit for highlighting</p>", terms: [{ name: "Very long term that exceeds the maximum character limit for highlighting", type: "concept" }] }
+    output: { highlight_count: 0 }
+
+  # DURABLE -- Word boundary matching
+  - name: "boundary - matches whole words only"
+    durability: durable
+    input: { html: "<p>Reactive programming uses React</p>", terms: [{ name: "React", type: "entity" }] }
+    output: { highlight_count: 1, highlighted_text: "React" }
+    note: "'Reactive' should not be highlighted, only the standalone 'React'"
+
+  # EPHEMERAL -- Edge cases
+  - name: "example - empty terms array produces no highlights"
+    durability: ephemeral
+    input: { html: "<p>Some text about technology</p>", terms: [] }
+    output: { highlight_count: 0 }
+
+  - name: "example - text without matching terms produces no highlights"
+    durability: ephemeral
+    input: { html: "<p>Hello world</p>", terms: [{ name: "React", type: "entity" }] }
+    output: { highlight_count: 0 }
+
+# -- KG Highlight Tooltip -----------------------------------------------------
+KGHighlightTooltip:
+  # DURABLE -- Tooltip behavior
+  - name: "boundary - clicking highlight opens tooltip"
+    durability: durable
+    input: { action: "click kg-highlight span for 'React'" }
+    output: { tooltip_visible: true, tooltip_term_name: "React", tooltip_type: "entity" }
+
+  - name: "boundary - tooltip shows related bookmark count"
+    durability: durable
+    input: { action: "click kg-highlight span", term: { name: "React", count: 5 } }
+    output: { tooltip_shows_count: "5 related bookmarks" }
+
+  - name: "boundary - tooltip shows up to 3 related bookmark links"
+    durability: durable
+    input: { action: "click highlight", term: { name: "React", count: 7 } }
+    output: { visible_bookmark_links_lte: 3, expand_link_visible: true }
+
+  - name: "boundary - tooltip has explore button"
+    durability: durable
+    input: { action: "click highlight" }
+    output: { explore_button_visible: true }
+
+  - name: "boundary - explore button submits term as new question"
+    durability: durable
+    input: { action: "click Explore button for 'React'" }
+    output: { question_input_value: "React", new_answer_streaming: true }
+
+  - name: "boundary - Escape closes tooltip"
+    durability: durable
+    input: { action: "press Escape while tooltip is open" }
+    output: { tooltip_visible: false, aria_expanded_on_highlight: "false" }
+
+  - name: "boundary - clicking outside closes tooltip"
+    durability: durable
+    input: { action: "click outside tooltip" }
+    output: { tooltip_visible: false }
+
+  - name: "boundary - tooltip has role=dialog"
+    durability: durable
+    input: { action: "click highlight to open tooltip" }
+    output: { tooltip_role: "dialog", tooltip_aria_live: "polite" }
+
+  # EPHEMERAL
+  - name: "example - Enter key activates highlight"
+    durability: ephemeral
+    input: { action: "focus kg-highlight span, press Enter" }
+    output: { tooltip_visible: true }
+
+  - name: "example - Space key activates highlight"
+    durability: ephemeral
+    input: { action: "focus kg-highlight span, press Space" }
+    output: { tooltip_visible: true }
+
+# -- Markdown Detection -------------------------------------------------------
+isMarkdownContent:
+  # DURABLE -- Pattern detection
+  - name: "boundary - detects header syntax"
+    durability: durable
+    input: { content: "# Main Title\n\nSome paragraph text" }
+    output: true
+
+  - name: "boundary - detects bold syntax"
+    durability: durable
+    input: { content: "This has **bold** words in it" }
+    output: true
+
+  - name: "boundary - detects link syntax"
+    durability: durable
+    input: { content: "Check [this link](https://example.com) out" }
+    output: true
+
+  - name: "boundary - detects unordered list syntax"
+    durability: durable
+    input: { content: "Items:\n- First item\n- Second item" }
+    output: true
+
+  - name: "boundary - detects ordered list syntax"
+    durability: durable
+    input: { content: "Steps:\n1. First step\n2. Second step" }
+    output: true
+
+  - name: "boundary - detects fenced code blocks"
+    durability: durable
+    input: { content: "Example:\n```javascript\nconst x = 1;\n```" }
+    output: true
+
+  - name: "boundary - detects table syntax"
+    durability: durable
+    input: { content: "| Name | Value |\n|------|-------|\n| A | 1 |" }
+    output: true
+
+  - name: "boundary - plain text returns false"
+    durability: durable
+    input: { content: "This is just plain text with no special formatting at all." }
+    output: false
+
+  - name: "boundary - text with brackets but no markdown returns false"
+    durability: durable
+    input: { content: "The array[0] element and the price is $5 (discounted)" }
+    output: false
+
+  # EPHEMERAL -- Edge cases
+  - name: "example - detects blockquote syntax"
+    durability: ephemeral
+    input: { content: "> This is a quote\n\nFollowed by text" }
+    output: true
+
+  - name: "example - detects inline code"
+    durability: ephemeral
+    input: { content: "Use the `console.log()` function" }
+    output: true
+
+  - name: "example - detects horizontal rule"
+    durability: ephemeral
+    input: { content: "Section 1\n\n---\n\nSection 2" }
+    output: true
+
+# -- Content Display Rendering -----------------------------------------------
+renderContentPreview:
+  # DURABLE -- Markdown path
+  - name: "boundary - markdown content rendered via marked.parse"
+    durability: durable
+    input: { content: "# Title\n\n**Bold** text with [link](https://example.com)" }
+    output: { html_contains_div_class_markdown_content: true, html_contains_h1: true, html_contains_strong: true }
+
+  # DURABLE -- Plain text fallback path
+  - name: "boundary - plain text rendered as paragraphs"
+    durability: durable
+    input: { content: "First paragraph with no markdown.\n\nSecond paragraph here." }
+    output: { html_contains_p_class_mb_4: true, paragraph_count: 2 }
+
+  - name: "boundary - plain text bold conversion"
+    durability: durable
+    input: { content: "This has **important** information" }
+    output: { html_contains_strong: true }
+    note: "Even in plain-text fallback, **text** is converted to <strong>"
+
+  - name: "boundary - label-colon pattern bolded in plain text"
+    durability: durable
+    input: { content: "Author: John Doe\nDate: 2024-01-15" }
+    output: { html_contains: "**Author:**", html_contains_2: "**Date:**" }
+    note: "Lines starting with 'Label:' get the label portion bolded"
+
+  # DURABLE -- Truncation
+  - name: "boundary - content over 1500 chars truncated with ellipsis"
+    durability: durable
+    input: { content: "x repeated 2000 times" }
+    output: { displayed_length_lte: 1503, ends_with_ellipsis: true }
+
+  - name: "boundary - content under 1500 chars shown in full"
+    durability: durable
+    input: { content: "Short content, only 100 chars or so." }
+    output: { displayed_content_equals_input: true, no_ellipsis: true }
+
+  # DURABLE -- Empty/null handling
+  - name: "boundary - null content shows placeholder"
+    durability: durable
+    input: { content: null }
+    output: { html_contains: "No content available" }
+
+  - name: "boundary - empty content shows placeholder"
+    durability: durable
+    input: { content: "" }
+    output: { html_contains: "No content available" }
+
+  # EPHEMERAL
+  - name: "example - whitespace normalization"
+    durability: ephemeral
+    input: { content: "Line 1\r\nLine 2\n\n\n\nLine 3" }
+    output: { no_triple_newlines: true, cr_lf_normalized: true }
+
+# -- Snippet Generation (Backend) --------------------------------------------
+getSnippet:
+  # DURABLE -- Source priority
+  - name: "boundary - content is preferred over notes"
+    durability: durable
+    input: { content: "Article content here", notes: "My notes" }
+    output: { snippet: "Article content here" }
+
+  - name: "boundary - notes used when content is empty"
+    durability: durable
+    input: { content: "", notes: "My personal notes about this topic" }
+    output: { snippet: "My personal notes about this topic" }
+
+  # DURABLE -- Truncation
+  - name: "boundary - content over 200 chars truncated"
+    durability: durable
+    input: { content: "x repeated 300 times" }
+    output: { snippet_length: 203, ends_with: "..." }
+
+  - name: "boundary - content at exactly 200 chars not truncated"
+    durability: durable
+    input: { content: "x repeated 200 times" }
+    output: { snippet_length: 200, no_ellipsis: true }
+
+  - name: "boundary - content under 200 chars returned as-is"
+    durability: durable
+    input: { content: "Short content" }
+    output: { snippet: "Short content" }
+
+  - name: "boundary - both empty returns empty snippet"
+    durability: durable
+    input: { content: "", notes: "" }
+    output: { snippet: "" }
+
+  # EPHEMERAL -- Graph-derived snippets
+  - name: "example - graph relationship snippet"
+    durability: ephemeral
+    input: { source: "graph", categories: ["Technology", "Web Dev"], concepts: ["React"] }
+    output: { snippet_contains: "Related through:", snippet_contains_2: "Technology" }
+
+# -- Bookmark List Summary Display --------------------------------------------
+BookmarkListSummaryDisplay:
+  # DURABLE -- Summary vs snippet fallback
+  - name: "boundary - summary shown when available"
+    durability: durable
+    input: { bookmark: { summary: "AI summary text", snippet: "First 200 chars" } }
+    output: { displayed_text: "AI summary text" }
+
+  - name: "boundary - snippet shown when summary is null"
+    durability: durable
+    input: { bookmark: { summary: null, snippet: "First 200 chars of content" } }
+    output: { displayed_text: "First 200 chars of content" }
+
+  - name: "boundary - snippet shown when summary is empty"
+    durability: durable
+    input: { bookmark: { summary: "", snippet: "First 200 chars" } }
+    output: { displayed_text: "First 200 chars" }
+
+  # DURABLE -- Truncation
+  - name: "boundary - text truncated to 2 lines via CSS line-clamp"
+    durability: durable
+    input: { bookmark: { summary: "Very long summary that spans many lines" } }
+    output: { css_class_contains: "line-clamp-2" }
+
+  # DURABLE -- Rendering mode
+  - name: "boundary - summary rendered as plain text (not HTML)"
+    durability: durable
+    input: { bookmark: { summary: "**Bold** and [link](url)" } }
+    output: { renders_as_plain_text: true, no_html_tags_in_output: true }
+    note: "List view uses x-text (not x-html), so markdown is shown as-is"
+
+# -- Detail Modal Summary Display ---------------------------------------------
+DetailModalSummaryDisplay:
+  # DURABLE -- Rendering
+  - name: "boundary - summary rendered via markdown auto-detect"
+    durability: durable
+    input: { summary: "1. **Main Topic**: Article about React\n2. **Key Points**:\n- Point 1\n- Point 2" }
+    output: { html_contains_div_class_markdown_content: true, html_contains_ol: true, html_contains_strong: true }
+
+  - name: "boundary - plain text summary rendered with paragraph formatting"
+    durability: durable
+    input: { summary: "A simple summary without any markdown formatting." }
+    output: { html_contains_p: true, no_markdown_content_class: true }
+
+  - name: "boundary - YouTube summary with timestamps renders correctly"
+    durability: durable
+    input: { summary: "Video Title\n\n00:00 [Introduction]\nKey point about the topic\n\n05:30 [Main Discussion]\n• Point 1\n• Point 2" }
+    output: { html_rendered: true, timestamps_visible: true }
+
+  - name: "boundary - null summary hides summary section"
+    durability: durable
+    input: { summary: null }
+    output: { summary_section_hidden: true }
+
+  - name: "boundary - empty summary hides summary section"
+    durability: durable
+    input: { summary: "" }
+    output: { summary_section_hidden: true }
+
 # =============================================================================
 # WEB UI INVARIANTS -- Properties that must hold in the UI layer
 # =============================================================================
@@ -1282,6 +1879,22 @@ ui_invariants:
   - name: "ui invariant - autocomplete closes on blur"
     after: [blur_search_input]
     property: "autocomplete dropdown is hidden within 200ms of search input blur event"
+
+  - name: "ui invariant - KG color system consistent across surfaces"
+    after: [highlightTextNodes, renderCitationCard, renderDetailModal]
+    property: "categories always use blue-100/blue-700, concepts use green-100/green-700, entities use orange-100/orange-700 in all UI contexts"
+
+  - name: "ui invariant - citation transformation completeness"
+    after: [formatAnswer]
+    property: "no raw [N] patterns remain in the rendered answer HTML; all have been transformed into <sup> elements"
+
+  - name: "ui invariant - summary display context determines rendering mode"
+    after: [renderBookmarkCard, renderDetailModal]
+    property: "bookmark list cards always use plain-text rendering (x-text), detail modal always uses markdown-aware rendering (x-html with auto-detection)"
+
+  - name: "ui invariant - content preview truncation with expand toggle"
+    after: [renderDetailModal]
+    property: "content over 1500 chars shows truncated preview with 'Show Full Content' button; content under 1500 chars shows in full without toggle"
 
 # =============================================================================
 # WEB UI EVALUATIONS -- Per-view behavioral checks
