@@ -1,4 +1,4 @@
-version: "0.6.1"
+version: "0.7.0"
 
 # Reference values:
 # - Embedding dimensions: 3072 (Gemini), 1536 (OpenAI)
@@ -14,6 +14,22 @@ version: "0.6.1"
 # - Citation ring highlight duration: 2 seconds
 # - KG term cache TTL: 5 minutes
 # - Snippet max length: 200 chars
+# - Analyze URL similarity weight: 70/30 semantic/lexical
+# - Analyze URL tags limit: 10 per type
+# - Answer Recent default days: 7, default limit: 20
+# - Graph Explore default depth: 2
+
+# =============================================================================
+# SAFETY INVARIANTS -- Highest priority, prevent dangerous states
+# =============================================================================
+safety:
+  - name: "safety - API tokens never appear in HTTP responses"
+    after: ["*"]
+    property: "No HTTP response body contains any configured API key value (OPENAI_API_KEY, GEMINI_API_KEY, TAVILY_API_KEY, NEO4J_PASSWORD, LANGFUSE_SECRET_KEY)"
+
+  - name: "safety - API tokens never appear in log output"
+    after: ["*"]
+    property: "No log line contains any configured API key value"
 
 # =============================================================================
 # SYSTEM INVARIANTS -- Properties that must hold after any state mutation
@@ -2169,3 +2185,273 @@ ChromeExtension:
     durability: ephemeral
     input: { action: "click Reset to Defaults, confirm" }
     output: { api_url: "http://localhost:8082", theme: "auto" }
+
+# =============================================================================
+# STATE MACHINE TRANSITIONS -- Job lifecycle (Section 8)
+# =============================================================================
+state_transitions:
+  - name: "transition - pending to processing on worker pickup"
+    machine: "job_lifecycle"
+    from: "pending"
+    trigger: "worker_pickup"
+    to: "processing"
+    profile: core
+
+  - name: "transition - processing to completed on success"
+    machine: "job_lifecycle"
+    from: "processing"
+    trigger: "processing_success"
+    to: "completed"
+    profile: core
+
+  - name: "transition - processing to failed on non-retryable error"
+    machine: "job_lifecycle"
+    from: "processing"
+    trigger: "non_retryable_error"
+    to: "failed"
+    profile: core
+
+  - name: "transition - processing to failed on max retries exhausted"
+    machine: "job_lifecycle"
+    from: "processing"
+    trigger: "max_retries_exhausted"
+    to: "failed"
+    profile: core
+
+  - name: "invalid transition - completed cannot return to processing"
+    machine: "job_lifecycle"
+    from: "completed"
+    trigger: "worker_pickup"
+    error: true
+    profile: core
+
+  - name: "invalid transition - failed cannot return to processing"
+    machine: "job_lifecycle"
+    from: "failed"
+    trigger: "worker_pickup"
+    error: true
+    profile: core
+
+  - name: "invalid transition - completed cannot return to pending"
+    machine: "job_lifecycle"
+    from: "completed"
+    trigger: "requeue"
+    error: true
+    profile: core
+
+  - name: "invalid transition - processing cannot return to pending"
+    machine: "job_lifecycle"
+    from: "processing"
+    trigger: "requeue"
+    error: true
+    profile: core
+
+# =============================================================================
+# NEW ENDPOINT EVALUATIONS (v0.7.0)
+# =============================================================================
+
+# -- Analyze URL API ----------------------------------------------------------
+AnalyzeURL:
+  # DURABLE -- Contract conformance
+  - name: "boundary - valid URL returns 200 with analysis"
+    durability: durable
+    profile: core
+    input: { url: "https://example.com/article" }
+    output: { status: 200, has_recommendation: true, has_similar_bookmarks: true }
+
+  - name: "boundary - duplicate URL returns recommendation duplicate"
+    durability: durable
+    profile: core
+    input: { url: "https://already-bookmarked.com" }
+    precondition: "bookmark with this URL exists"
+    output: { status: 200, recommendation: "duplicate", similarity_score: 1.0 }
+
+  - name: "boundary - fast_mode skips AI analysis"
+    durability: durable
+    profile: core
+    input: { url: "https://example.com", fast_mode: true }
+    output: { status: 200, analysis: null }
+
+  - name: "error - missing URL returns 400"
+    durability: durable
+    profile: core
+    input: {}
+    output: { status: 400 }
+
+  - name: "error - non-POST returns 405"
+    durability: durable
+    profile: core
+    input: { method: "GET" }
+    output: { status: 405 }
+
+  # DURABLE -- Tags limit
+  - name: "boundary - tags limited to 10 per type"
+    durability: durable
+    profile: core
+    input: { url: "https://example.com/article-with-many-entities" }
+    output: { tags_categories_count_lte: 10, tags_concepts_count_lte: 10, tags_entities_count_lte: 10 }
+
+# -- Answer Recent API --------------------------------------------------------
+AnswerRecent:
+  # DURABLE -- Contract conformance
+  - name: "boundary - missing query returns 400"
+    durability: durable
+    profile: core
+    input: { q: "" }
+    output: { status: 400 }
+
+  - name: "boundary - non-GET returns 405"
+    durability: durable
+    profile: core
+    input: { method: "POST" }
+    output: { status: 405 }
+
+  - name: "boundary - default days is 7"
+    durability: durable
+    profile: core
+    input: { q: "recent articles" }
+    output: { days_used: 7 }
+
+  - name: "boundary - stream ends with done event"
+    durability: durable
+    profile: core
+    input: { q: "recent articles" }
+    output: { last_event: "done" }
+
+  - name: "boundary - no bookmarks in range skips LLM"
+    durability: durable
+    profile: core
+    input: { q: "recent articles", days: 0 }
+    precondition: "no bookmarks in last 0 days"
+    output: { llm_invoked: false }
+
+  # EPHEMERAL -- Custom parameters
+  - name: "example - custom days and limit"
+    durability: ephemeral
+    profile: core
+    input: { q: "articles", days: 30, limit: 5 }
+    output: { bookmarks_count_lte: 5 }
+
+# -- Knowledge Terms API ------------------------------------------------------
+GetKnowledgeTerms:
+  # DURABLE -- Contract conformance
+  - name: "boundary - returns categories, concepts, entities arrays"
+    durability: durable
+    profile: core
+    input: {}
+    output: { status: 200, has_categories: true, has_concepts: true, has_entities: true, has_total: true }
+
+  - name: "boundary - graph unavailable returns 501"
+    durability: durable
+    profile: core
+    input: {}
+    precondition: "graph service is nil"
+    output: { status: 501 }
+
+  - name: "boundary - categories filtered to those with bookmarks"
+    durability: durable
+    profile: core
+    input: {}
+    output: { all_categories_have_count_gt_0: true }
+
+  - name: "boundary - total equals sum of array lengths"
+    durability: durable
+    profile: core
+    input: {}
+    output: { total_equals_categories_plus_concepts_plus_entities: true }
+
+# -- Graph Explore API --------------------------------------------------------
+GraphExplore:
+  # DURABLE -- Contract conformance
+  - name: "boundary - valid bookmark_id returns related bookmarks"
+    durability: durable
+    profile: core
+    input: { bookmark_id: "valid-uuid" }
+    output: { status: 200, has_related_bookmarks: true }
+
+  - name: "boundary - missing bookmark_id returns 400"
+    durability: durable
+    profile: core
+    input: {}
+    output: { status: 400 }
+
+  - name: "boundary - default depth is 2"
+    durability: durable
+    profile: core
+    input: { bookmark_id: "valid-uuid" }
+    output: { depth_used: 2 }
+
+  - name: "error - non-POST returns 405"
+    durability: durable
+    profile: core
+    input: { method: "GET" }
+    output: { status: 405 }
+
+# -- Graph Search API ---------------------------------------------------------
+GraphSearch:
+  # DURABLE -- Contract conformance
+  - name: "boundary - search by category returns results"
+    durability: durable
+    profile: core
+    input: { category: "Technology" }
+    output: { status: 200, has_results: true }
+
+  - name: "boundary - search by concept returns results"
+    durability: durable
+    profile: core
+    input: { concept: "Microservices" }
+    output: { status: 200, has_results: true }
+
+  - name: "boundary - category takes precedence over concept"
+    durability: durable
+    profile: core
+    input: { category: "Technology", concept: "Microservices" }
+    output: { searched_by: "category" }
+
+  - name: "error - neither field returns 400"
+    durability: durable
+    profile: core
+    input: {}
+    output: { status: 400 }
+
+# -- Graph Index All API ------------------------------------------------------
+GraphIndexAll:
+  # DURABLE -- Contract conformance
+  - name: "boundary - returns 202 with count"
+    durability: durable
+    profile: core
+    input: {}
+    output: { status: 202, has_message: true, has_count: true }
+
+  - name: "boundary - indexing is async (non-blocking)"
+    durability: durable
+    profile: core
+    input: {}
+    output: { response_returns_before_indexing_completes: true }
+
+# -- API Documentation -------------------------------------------------------
+APIDocumentation:
+  # DURABLE -- Endpoint availability
+  - name: "boundary - /api redirects to /api/docs"
+    durability: durable
+    profile: core
+    input: { path: "/api" }
+    output: { status: 301, location: "/api/docs" }
+
+  - name: "boundary - /api/docs returns HTML"
+    durability: durable
+    profile: core
+    input: { path: "/api/docs" }
+    output: { status: 200, content_type: "text/html" }
+
+  - name: "boundary - /api/openapi.yaml returns YAML"
+    durability: durable
+    profile: core
+    input: { path: "/api/openapi.yaml" }
+    output: { status: 200, content_type: "application/x-yaml" }
+
+  - name: "boundary - /api/openapi.yaml has CORS header"
+    durability: durable
+    profile: core
+    input: { path: "/api/openapi.yaml" }
+    output: { header_access_control_allow_origin: "*" }
