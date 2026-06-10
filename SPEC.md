@@ -1076,9 +1076,9 @@ Configuration values are resolved in this order (first wins):
 Google Gemini is the sole AI provider (embeddings + chat). The provider abstraction (Section 15.10) remains so alternative providers can be added in the future, but only Gemini is specified.
 
 - `GEMINI_API_KEY`: string, **required** (unless using Vertex AI or ADC) — Gemini API key
-- `GEMINI_CHAT_MODEL`: string, default `"gemini-2.0-flash-exp"` — Model for chat completions
+- `GEMINI_CHAT_MODEL`: string, default `"gemini-2.5-flash"` — Model for chat completions
 - `GEMINI_EMBEDDING_MODEL`: string, default `"gemini-embedding-001"` — Model for embeddings
-- `GEMINI_SUMMARY_MODEL`: string, default `"gemini-2.0-flash-exp"` — Model for summary generation
+- `GEMINI_SUMMARY_MODEL`: string, default `"gemini-2.5-flash"` — Model for summary generation
 - `GEMINI_EMBEDDING_DIMENSIONS`: string (parsed as int), default `"3072"` — Embedding vector dimensions. Valid: `768`, `1536`, `3072`.
 - `GOOGLE_APPLICATION_CREDENTIALS`: string (file path), optional — Alternative to `GEMINI_API_KEY` for Google Cloud ADC
 - `GOOGLE_GENAI_USE_VERTEXAI`: string, optional — Set to `"true"` to use Vertex AI instead of Gemini API
