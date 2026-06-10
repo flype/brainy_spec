@@ -1408,7 +1408,7 @@ extractCitedNumbers:
     durability: ephemeral
     input: { text: "The code `arr[0]` shows [1] and the map `m[key]` relates to [2]" }
     output: [1, 2]
-    note: "arr[0] contains a digit but is part of code context - regex still matches [0] as a citation"
+    note: "arr[0] contains a digit, but [0] is never a valid citation: numbering starts at [1] and the citation event contract requires number > 0"
 
 # -- Answer Formatting (Citation Transformation) ------------------------------
 formatAnswer:
