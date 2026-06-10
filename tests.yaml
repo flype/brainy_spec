@@ -1,7 +1,7 @@
-version: "0.7.0"
+version: "0.7.1"
 
 # Reference values:
-# - Embedding dimensions: 3072 (Gemini), 1536 (OpenAI)
+# - Embedding dimensions: 3072 (Gemini default; 768/1536/3072 configurable)
 # - Chunking threshold: 24000 chars
 # - Max chunk size: 4000 chars
 # - Chunk overlap: 400 chars
@@ -25,7 +25,7 @@ version: "0.7.0"
 safety:
   - name: "safety - API tokens never appear in HTTP responses"
     after: ["*"]
-    property: "No HTTP response body contains any configured API key value (OPENAI_API_KEY, GEMINI_API_KEY, TAVILY_API_KEY, NEO4J_PASSWORD, LANGFUSE_SECRET_KEY)"
+    property: "No HTTP response body contains any configured API key value (GEMINI_API_KEY, TAVILY_API_KEY, NEO4J_PASSWORD, LANGFUSE_SECRET_KEY)"
 
   - name: "safety - API tokens never appear in log output"
     after: ["*"]
@@ -972,27 +972,23 @@ JobQueue:
 # -- Embedding Provider -------------------------------------------------------
 EmbeddingProvider:
   # DURABLE -- Dimension validation
-  - name: "boundary - OpenAI returns 1536 dimensions"
-    durability: durable
-    input: { provider: "openai", text: "Hello world" }
-    output: { dimensions: 1536 }
-
   - name: "boundary - Gemini returns 3072 dimensions"
     durability: durable
     input: { provider: "gemini", text: "Hello world" }
     output: { dimensions: 3072 }
 
-  # DURABLE -- Long content handling
-  - name: "boundary - OpenAI truncates at 24000 chars"
+  - name: "boundary - dimensions match configured value"
     durability: durable
-    input: { provider: "openai", text: "x repeated 30000 times" }
-    output: { embedding_generated: true, dimensions: 1536 }
-    note: "Content is summarized before embedding, not truncated at embed time"
+    input: { provider: "gemini", configured_dimensions: 768, text: "Hello world" }
+    output: { dimensions: 768 }
+    note: "GEMINI_EMBEDDING_DIMENSIONS (768/1536/3072) determines vector length; all stored vectors share it (INV-009)"
 
-  - name: "boundary - Gemini truncates at 80000 chars"
+  # DURABLE -- Long content handling
+  - name: "boundary - content over 80000 chars is summarized before embedding"
     durability: durable
     input: { provider: "gemini", text: "x repeated 100000 times" }
     output: { embedding_generated: true, dimensions: 3072 }
+    note: "Content is summarized before embedding, not truncated at embed time"
 
 # -- SSE Answer Stream --------------------------------------------------------
 AnswerQuestion:
@@ -1116,20 +1112,20 @@ SummaryGeneration:
     output: { summary_format: "article_5_section" }
 
   # DURABLE -- Token limits per content type and provider
-  - name: "boundary - YouTube summary max tokens is 4000 (OpenAI) or 8000 (Gemini)"
+  - name: "boundary - YouTube summary max tokens is 8000"
     durability: durable
     input: { content_type: "youtube" }
-    output: { max_tokens_openai: 4000, max_tokens_gemini: 8000 }
+    output: { max_tokens: 8000 }
 
   - name: "boundary - social media summary max tokens is 1000"
     durability: durable
     input: { content_type: "twitter" }
     output: { max_tokens: 1000 }
 
-  - name: "boundary - article summary max tokens is 2000 (OpenAI) or 8000 (Gemini)"
+  - name: "boundary - article summary max tokens is 8000"
     durability: durable
     input: { content_type: "webpage" }
-    output: { max_tokens_openai: 2000, max_tokens_gemini: 8000 }
+    output: { max_tokens: 8000 }
 
   # EPHEMERAL -- Format examples
   - name: "example - YouTube summary includes speaker attributions"

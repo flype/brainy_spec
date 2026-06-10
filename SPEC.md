@@ -1,6 +1,6 @@
 # Brainy - Smart Bookmark Vault Specification
 
-Status: Draft v0.7.0 (language-agnostic)
+Status: Draft v0.7.1 (language-agnostic)
 
 Purpose: Brainy is a single-user bookmark knowledge base that ingests URLs, extracts and enriches content using AI, stores it with vector embeddings for hybrid search, maintains a knowledge graph for entity-based discovery, and answers natural language questions with citations from the user's collection.
 
@@ -69,7 +69,7 @@ Important boundary:
    - Optional — system degrades gracefully without it
 
 5. **AI Services (Embedding + Chat)**
-   - Embedding generation for semantic search (OpenAI or Gemini)
+   - Embedding generation for semantic search (Google Gemini)
    - Chat completions for answer generation, summarization, and entity extraction
    - Observability via Langfuse tracing
 
@@ -86,7 +86,7 @@ Important boundary:
 
 - PostgreSQL with pgvector extension (vector search)
 - Neo4j (knowledge graph, optional)
-- OpenAI API or Google Gemini API (embeddings + chat)
+- Google Gemini API (embeddings + chat)
 - Tavily API (advanced scraping + paywall bypass, optional)
 - Langfuse (AI observability, optional)
 
@@ -123,7 +123,7 @@ Fields:
 - `summary` (string or null) — AI-generated summary, content-type-specific format
 - `notes` (string or null) — User-provided freeform notes (markdown)
 - `language` (string or null) — Detected language: `"en"`, `"es"`, or `"mixed"`
-- `embedding` (vector or null) — Embedding vector (3072 dims for Gemini, 1536 for OpenAI)
+- `embedding` (vector or null) — Embedding vector (3072 dims by default; configurable via `GEMINI_EMBEDDING_DIMENSIONS`)
 - `content_type` (string) — One of: `"webpage"`, `"youtube"`, `"twitter"`, `"instagram"`, `"tiktok"`, `"article"`, `"note"`. Defaults to `"webpage"`.
 - `metadata` (json_object or null) — Platform-specific metadata (see Metadata Schema in Section 9)
 - `read_status` (boolean, required) — Whether the user has marked this as read. Defaults to `false`. Never null.
@@ -213,7 +213,7 @@ Properties that must hold across ALL implementations, regardless of language, ar
 
 - **SAFE-001**: The system runs on localhost or a private network with no authentication. All API endpoints are unauthenticated. Deploying on a public network without additional authentication is a security violation. *Rationale: single-user system not designed for multi-tenant access.*
 
-- **SAFE-002**: API tokens (OpenAI, Gemini, Tavily, Langfuse, Neo4j password) are never logged or included in API responses. *Rationale: prevents credential exposure in logs or client-visible output.*
+- **SAFE-002**: API tokens (Gemini, Tavily, Langfuse, Neo4j password) are never logged or included in API responses. *Rationale: prevents credential exposure in logs or client-visible output.*
 
 ### 6.2 System Invariants
 
@@ -1071,22 +1071,13 @@ Configuration values are resolved in this order (first wins):
 - `SERVER_PORT`: string, default `"8080"` — HTTP server listen port
 - `DATABASE_URL`: string, **required** — PostgreSQL connection string (e.g., `postgres://user@localhost:5432/brainy_db?sslmode=disable`)
 
-#### Embedding Provider Selection
-
-- `EMBEDDING_PROVIDER`: string, default `"openai"` — Which embedding provider to use. Values: `"openai"` or `"gemini"`.
-
-#### OpenAI Configuration
-
-- `OPENAI_API_KEY`: string, **required when provider=openai** — OpenAI API key
-- `OPENAI_CHAT_MODEL`: string, default `"gpt-4o-mini"` — Model for chat completions
-- `OPENAI_EMBEDDING_MODEL`: string, default `"text-embedding-3-small"` — Model for embeddings (1536 dimensions)
-- `OPENAI_SUMMARY_MODEL`: string, default `"gpt-4o-mini"` — Model for summary generation
-
 #### Google Gemini Configuration
 
-- `GEMINI_API_KEY`: string, **required for Gemini** (unless using Vertex AI) — Gemini API key
+Google Gemini is the sole AI provider (embeddings + chat). The provider abstraction (Section 15.10) remains so alternative providers can be added in the future, but only Gemini is specified.
+
+- `GEMINI_API_KEY`: string, **required** (unless using Vertex AI or ADC) — Gemini API key
 - `GEMINI_CHAT_MODEL`: string, default `"gemini-2.0-flash-exp"` — Model for chat completions
-- `GEMINI_EMBEDDING_MODEL`: string, default `"text-embedding-004"` — Model for embeddings
+- `GEMINI_EMBEDDING_MODEL`: string, default `"gemini-embedding-001"` — Model for embeddings
 - `GEMINI_SUMMARY_MODEL`: string, default `"gemini-2.0-flash-exp"` — Model for summary generation
 - `GEMINI_EMBEDDING_DIMENSIONS`: string (parsed as int), default `"3072"` — Embedding vector dimensions. Valid: `768`, `1536`, `3072`.
 - `GOOGLE_APPLICATION_CREDENTIALS`: string (file path), optional — Alternative to `GEMINI_API_KEY` for Google Cloud ADC
@@ -1149,11 +1140,6 @@ These values are compiled into the binary and cannot be changed at runtime:
 - Socket connect timeout: 30 seconds
 - Write retry attempts: 3
 
-#### OpenAI Limits
-- Max embedding tokens: 6,000
-- Max chars for embedding: 24,000 (6,000 × 4 chars/token)
-- Content too long for summarization: 100,000 chars
-
 #### Gemini Limits
 - Max embedding tokens: 20,000
 - Max chars for embedding: 80,000 (20,000 × 4 chars/token)
@@ -1172,8 +1158,7 @@ These values are compiled into the binary and cannot be changed at runtime:
 
 #### Chat Completion Defaults
 - Streaming chat: temperature 0.7, max tokens 2,000
-- Summary (OpenAI): temperature 0.5, max tokens varies by type (YouTube: 4,000, social: 1,000, article: 2,000)
-- Summary (Gemini): temperature 0.5, max tokens 8,000 (social: 1,000)
+- Summary: temperature 0.5, max tokens 8,000 (social: 1,000)
 - Smart model routing (Gemini): large model for JSON extraction >10K tokens or content >20K chars
 
 #### UI Constants
@@ -1192,8 +1177,7 @@ These values are compiled into the binary and cannot be changed at runtime:
 
 Startup validation (blocks startup if failed):
 - `DATABASE_URL` must be set and connectable
-- At least one embedding provider must be configured (either `OPENAI_API_KEY` or `GEMINI_API_KEY`)
-- If `EMBEDDING_PROVIDER=gemini`, `GEMINI_API_KEY` or `GOOGLE_APPLICATION_CREDENTIALS` must be set
+- `GEMINI_API_KEY` or `GOOGLE_APPLICATION_CREDENTIALS` must be set
 - `GEMINI_EMBEDDING_DIMENSIONS` must be one of: 768, 1536, 3072
 
 Per-operation validation:
@@ -1704,10 +1688,10 @@ Generated during bookmark ingestion (pipeline step 9) and during re-extraction. 
 
 | Content Type | Prompt Strategy | Max Output Tokens | Temperature |
 |---|---|---|---|
-| `youtube` | Title + intro paragraph + timestamped standalone-summary outline | 4000 (OpenAI) / 8000 (Gemini) | 0.5 |
+| `youtube` | Title + intro paragraph + timestamped standalone-summary outline | 8000 | 0.5 |
 | `twitter` / `tiktok` | Main message, key facts, context, and tone in 2-3 paragraphs | 1000 | 0.5 |
-| `article` / `webpage` | 5-section numbered structure | 2000 (OpenAI) / 8000 (Gemini) | 0.5 |
-| default | Generic: main topic, key points, technical info, conclusions | 2000 (OpenAI) / 8000 (Gemini) | 0.5 |
+| `article` / `webpage` | 5-section numbered structure | 8000 | 0.5 |
+| default | Generic: main topic, key points, technical info, conclusions | 8000 | 0.5 |
 
 #### YouTube Summary Format
 
@@ -2051,7 +2035,7 @@ Required only for optional features that an implementation chooses to ship.
 
 Environment-dependent checks recommended before production use.
 
-- Embedding generation with real API keys (OpenAI or Gemini)
+- Embedding generation with real API keys (Gemini)
 - Content scraping of live URLs
 - Neo4j entity extraction round-trip
 - Archive.today availability check
@@ -2427,8 +2411,7 @@ This section documents the technology choices made in the initial implementation
 | Relational database | PostgreSQL | With pgvector extension for vector indexes |
 | Full-text search | PostgreSQL tsvector | `GENERATED ALWAYS` columns, `ts_rank_cd` for ranking |
 | Knowledge graph | Neo4j | Cypher queries, MERGE for idempotent node creation |
-| Embedding provider (primary) | Google Gemini `gemini-embedding-001` | 3072 dimensions, task-type support |
-| Embedding provider (secondary) | OpenAI `text-embedding-3-small` | 1536 dimensions |
+| Embedding provider | Google Gemini `gemini-embedding-001` | 3072 dimensions, task-type support |
 | Chat model (large) | Gemini `gemini-2.5-pro` | Used for complex extraction and long content |
 | Chat model (small) | Gemini `gemini-2.5-flash` | Used for summaries and small tasks |
 | Archive/paywall fallback | Tavily API | Retrieves archived versions of paywalled content |
@@ -2466,6 +2449,7 @@ This section documents the technology choices made in the initial implementation
 
 ## Version History
 
+- **v0.7.1** - Consolidated to Google Gemini as the sole AI provider, matching the v0.5.1/v0.6.0 implementation change: removed `EMBEDDING_PROVIDER` selector and all OpenAI configuration, limits, and token budgets from Sections 3, 5, 6, 10, 15.8, 21.3, and Appendix A. Fixed `GEMINI_EMBEDDING_MODEL` default from `text-embedding-004` (768-dim model) to `gemini-embedding-001` (supports the 3072-dim default). The provider abstraction (Section 15.10) is retained for future extensibility. Updated tests.yaml to match.
 - **v0.7.0** - Full restructure to numbered section format. Added: Problem Statement and Non-Goals (Sections 1-2), Core Domain Model with entity field definitions (Section 5), Job Lifecycle State Machine (Section 8), Configuration Specification with full environment variable enumeration (Section 10), Failure Model and Recovery (Section 17), Security and Safety (Section 18), Observability (Section 19), Validation Profiles (Section 21), Reference Algorithms (Section 16). New endpoints: Analyze URL, Answer Recent, Graph Explore, Graph Search, Graph Index All, Knowledge Terms, API Documentation. Safety invariants SAFE-001 and SAFE-002 added. 23 total interface contracts documented (up from 14).
 - **v0.6.1** - Updated YouTube Summary Format to match actual codebase output: added introductory summary paragraph, adaptive timestamp format (MM:SS / HH:MM:SS), rich per-section descriptions instead of sparse bullets, removed bracket requirement for section headers, added language-matching requirement. Added PROP-023 for summary language matching. Clarified provider-specific token budgets (OpenAI 4000 vs Gemini 8000). Updated tests.yaml to reflect richer YouTube summary format.
 - **v0.6.0** - Added Answer Rendering Pipeline section (markdown rendering, citation transformation with scroll-to-card + ring animation, rendering stages). Added Knowledge Graph Term Highlighting section (TreeWalker algorithm, color system, overlap resolution, tooltip behavior, accessibility). Added Content Display Formatting section (markdown auto-detection patterns, rendering by view context, plain-text fallback, snippet generation). Added INV-013 through INV-015 for highlighting and citation invariants. Added PROP-017 through PROP-022 for rendering pipeline properties. Added tests for extractCitedNumbers, formatAnswer, KG highlighting, markdown detection, and content rendering.
